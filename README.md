@@ -1,21 +1,23 @@
-# LLM Allocation Simulator — C++ port
+# Dispensator
 
-A full C++17 port of the Python `llm_alloc` package, using **LibTorch** for the
-DQN allocator and **nlohmann/json** for JSON export.
+A C++17 reinforcement-learning simulator that allocates incoming LLM prompts
+across a heterogeneous GPU fleet, jointly optimising latency, energy, and answer
+quality. Uses **LibTorch** for the DQN allocator and **nlohmann/json** for JSON
+export.
 
 ## Modules
 
-| Header / source                | Python original          |
-|--------------------------------|--------------------------|
-| `domain.{hpp,cpp}`             | `domain.py`              |
-| `simulator.{hpp,cpp}`          | `simulator.py`           |
-| `batched_simulator.{hpp,cpp}`  | `batched_simulator.py`   |
-| `allocators.{hpp,cpp}`         | `allocators.py`          |
-| `metrics.{hpp,cpp}`            | `metrics.py`             |
-| `learning.{hpp,cpp}`           | `learning.py` (eps-greedy, tabular Q, DQN, train loop) |
-| `apps/run_main.cpp`            | `run.py`                 |
-| `apps/benchmark_main.cpp`      | `benchmark.py`           |
-| `apps/sweep_main.cpp`          | `sweep.py`               |
+| Header / source                | Responsibility                                       |
+|--------------------------------|------------------------------------------------------|
+| `domain.{hpp,cpp}`             | GPU / LLM / Prompt models, pools, prompt generator   |
+| `simulator.{hpp,cpp}`          | Static one-job-per-GPU engine + reward/physics model |
+| `batched_simulator.{hpp,cpp}`  | Event-driven continuous-batching engine, power mgmt  |
+| `allocators.{hpp,cpp}`         | Heuristic allocators (random, difficulty, energy...) |
+| `metrics.{hpp,cpp}`            | Per-run metric aggregation                           |
+| `learning.{hpp,cpp}`           | Learners: ε-greedy, tabular Q-learning, DQN; train loop |
+| `apps/run_main.cpp`            | Comparison runner (`llm_run`)                        |
+| `apps/benchmark_main.cpp`      | Benchmark runner with JSON export (`llm_benchmark`)  |
+| `apps/sweep_main.cpp`          | Parameter sweeps (`llm_sweep`)                       |
 
 ## Dependencies
 
