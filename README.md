@@ -53,15 +53,3 @@ cmake --build . -j4
 ctest                                      # same, via CTest
 ```
 
-## Notes on fidelity
-
-- The reward/physics model, the continuous-batching event loop (admission,
-  decode steps, power-state machine, overhead attribution), the SMDP sojourn
-  discount, and the Double-DQN training step mirror the Python implementation.
-- **RNG determinism is not bit-identical** to Python: C++ uses `std::mt19937_64`
-  with `std::normal_distribution` / `std::exponential_distribution`, which do
-  not reproduce CPython's `random` module output. Seeded runs are reproducible
-  *within* the C++ build, and statistical properties (difficulty bounds,
-  distributions) match, but exact per-prompt values differ from Python.
-- Matplotlib plotting from `run.py` is not ported; use the JSON export with an
-  external plotting script instead.
