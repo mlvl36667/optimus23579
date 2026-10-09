@@ -47,26 +47,37 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 # CUDA runtime resolution for CUDA Torch builds.
 # ---------------------------------------------------------------------------
 # This project is CPU-only, but a CUDA Torch build (conda / pip cu* wheels)
-# has libtorch.so NEEDED-linked against libtorch_cuda.so -> libc10_cuda.so,
-# so the CUDA libraries are pulled in transitively and the linker must resolve
-# their libcudart symbols even though we never call a CUDA op.
+# has libtorch.so NEEDED-linked against libtorch_cuda.so -> libc10_cuda.so, so
+# the CUDA libraries come in transitively and the linker must resolve their
+# libcudart symbols even though we never call a CUDA op.
 #
 # The failure
 #   libc10_cuda.so: undefined reference to cudaGetDriverEntryPointByVersion
 # happens when the system libcudart (/usr/lib/.../libcudart.so.12) is OLDER
-# than the one the wheel was built against.  Modern pip/conda torch ships the
-# matching runtime in the `nvidia-cuda-runtime` package next to torch; point
-# the linker (and rpath) at it so the correct symbols are found.
+# than the one the wheel was built against.  A -L search path is not enough:
+# the DT_NEEDED libcudart.so.12 can still be resolved from the implicit
+# /usr/lib first.  So we link the bundled libcudart by its FULL PATH (which the
+# linker uses to satisfy the undefined symbol) and, as a belt-and-braces
+# measure, allow unresolved symbols in the transitively pulled CUDA .so files
+# (they are never called in this CPU-only build).
+set(LLM_ALLOC_CUDART "")
 get_filename_component(_TORCH_LIBDIR "${TORCH_LIBRARY}" DIRECTORY)
 if(_TORCH_LIBDIR)
-  # torch/lib/../../nvidia/cuda_runtime/lib
   get_filename_component(_SITE_PKGS "${_TORCH_LIBDIR}/../.." ABSOLUTE)
-  set(_NVIDIA_CUDART "${_SITE_PKGS}/nvidia/cuda_runtime/lib")
-  if(EXISTS "${_NVIDIA_CUDART}/libcudart.so.12")
-    message(STATUS "Using bundled CUDA runtime: ${_NVIDIA_CUDART}")
-    link_directories(BEFORE "${_NVIDIA_CUDART}")
-    list(APPEND CMAKE_BUILD_RPATH "${_NVIDIA_CUDART}")
-    list(APPEND CMAKE_INSTALL_RPATH "${_NVIDIA_CUDART}")
+  foreach(_cand
+      "${_SITE_PKGS}/nvidia/cuda_runtime/lib/libcudart.so.12"
+      "${_TORCH_LIBDIR}/libcudart.so.12")
+    if(EXISTS "${_cand}" AND NOT LLM_ALLOC_CUDART)
+      set(LLM_ALLOC_CUDART "${_cand}")
+    endif()
+  endforeach()
+  if(LLM_ALLOC_CUDART)
+    message(STATUS "Using bundled CUDA runtime: ${LLM_ALLOC_CUDART}")
+    get_filename_component(_CUDART_DIR "${LLM_ALLOC_CUDART}" DIRECTORY)
+    list(APPEND CMAKE_BUILD_RPATH "${_CUDART_DIR}" "${_TORCH_LIBDIR}")
+    list(APPEND CMAKE_INSTALL_RPATH "${_CUDART_DIR}" "${_TORCH_LIBDIR}")
+    # Tolerate unresolved symbols in the pulled-in CUDA .so files.
+    set(LLM_ALLOC_LINK_FLAGS "-Wl,--allow-shlib-undefined")
   endif()
 endif()
 
@@ -92,6 +103,12 @@ target_include_directories(llm_alloc PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(llm_alloc PUBLIC "${LLM_ALLOC_TORCH_LIBS}")
+if(LLM_ALLOC_CUDART)
+  # Full-path libcudart ahead of everything so DT_NEEDED libcudart.so.12
+  # resolves against the bundled (newer) runtime, not the system one.
+  target_link_libraries(llm_alloc PUBLIC "${LLM_ALLOC_CUDART}")
+  target_link_options(llm_alloc PUBLIC "${LLM_ALLOC_LINK_FLAGS}")
+endif()
 if(nlohmann_json_FOUND)
   target_link_libraries(llm_alloc PUBLIC nlohmann_json::nlohmann_json)
 endif()
