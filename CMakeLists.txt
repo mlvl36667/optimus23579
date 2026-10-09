@@ -44,25 +44,33 @@ find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 # ---------------------------------------------------------------------------
-# CPU-only linking.
+# CUDA runtime resolution for CUDA Torch builds.
 # ---------------------------------------------------------------------------
-# This project is CPU-only.  When Torch is a CUDA build (e.g. the conda/pip
-# cu* wheels), ${TORCH_LIBRARIES} pulls in libc10_cuda / libtorch_cuda, which
-# in turn require a matching CUDA runtime at link time.  On a host whose
-# libcudart differs from the one the wheel was built against, linking fails
-# with errors like:
+# This project is CPU-only, but a CUDA Torch build (conda / pip cu* wheels)
+# has libtorch.so NEEDED-linked against libtorch_cuda.so -> libc10_cuda.so,
+# so the CUDA libraries are pulled in transitively and the linker must resolve
+# their libcudart symbols even though we never call a CUDA op.
+#
+# The failure
 #   libc10_cuda.so: undefined reference to cudaGetDriverEntryPointByVersion
-# Since we never call any CUDA op, drop the CUDA libraries and keep only the
-# CPU core.  Allow opting back in with -DLLM_ALLOC_USE_CUDA=ON.
-option(LLM_ALLOC_USE_CUDA "Link the CUDA Torch libraries" OFF)
-set(LLM_ALLOC_TORCH_LIBS "")
-foreach(_lib ${TORCH_LIBRARIES})
-  if(NOT LLM_ALLOC_USE_CUDA AND "${_lib}" MATCHES "cuda|cudart|nvToolsExt|c10_cuda|caffe2_nvrtc")
-    message(STATUS "Skipping CUDA Torch lib (CPU-only build): ${_lib}")
-  else()
-    list(APPEND LLM_ALLOC_TORCH_LIBS "${_lib}")
+# happens when the system libcudart (/usr/lib/.../libcudart.so.12) is OLDER
+# than the one the wheel was built against.  Modern pip/conda torch ships the
+# matching runtime in the `nvidia-cuda-runtime` package next to torch; point
+# the linker (and rpath) at it so the correct symbols are found.
+get_filename_component(_TORCH_LIBDIR "${TORCH_LIBRARY}" DIRECTORY)
+if(_TORCH_LIBDIR)
+  # torch/lib/../../nvidia/cuda_runtime/lib
+  get_filename_component(_SITE_PKGS "${_TORCH_LIBDIR}/../.." ABSOLUTE)
+  set(_NVIDIA_CUDART "${_SITE_PKGS}/nvidia/cuda_runtime/lib")
+  if(EXISTS "${_NVIDIA_CUDART}/libcudart.so.12")
+    message(STATUS "Using bundled CUDA runtime: ${_NVIDIA_CUDART}")
+    link_directories(BEFORE "${_NVIDIA_CUDART}")
+    list(APPEND CMAKE_BUILD_RPATH "${_NVIDIA_CUDART}")
+    list(APPEND CMAKE_INSTALL_RPATH "${_NVIDIA_CUDART}")
   endif()
-endforeach()
+endif()
+
+set(LLM_ALLOC_TORCH_LIBS "${TORCH_LIBRARIES}")
 
 # ---------------------------------------------------------------------------
 # nlohmann/json (header-only, system install at /usr/include/nlohmann)
