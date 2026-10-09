@@ -44,6 +44,27 @@ find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 # ---------------------------------------------------------------------------
+# CPU-only linking.
+# ---------------------------------------------------------------------------
+# This project is CPU-only.  When Torch is a CUDA build (e.g. the conda/pip
+# cu* wheels), ${TORCH_LIBRARIES} pulls in libc10_cuda / libtorch_cuda, which
+# in turn require a matching CUDA runtime at link time.  On a host whose
+# libcudart differs from the one the wheel was built against, linking fails
+# with errors like:
+#   libc10_cuda.so: undefined reference to cudaGetDriverEntryPointByVersion
+# Since we never call any CUDA op, drop the CUDA libraries and keep only the
+# CPU core.  Allow opting back in with -DLLM_ALLOC_USE_CUDA=ON.
+option(LLM_ALLOC_USE_CUDA "Link the CUDA Torch libraries" OFF)
+set(LLM_ALLOC_TORCH_LIBS "")
+foreach(_lib ${TORCH_LIBRARIES})
+  if(NOT LLM_ALLOC_USE_CUDA AND "${_lib}" MATCHES "cuda|cudart|nvToolsExt|c10_cuda|caffe2_nvrtc")
+    message(STATUS "Skipping CUDA Torch lib (CPU-only build): ${_lib}")
+  else()
+    list(APPEND LLM_ALLOC_TORCH_LIBS "${_lib}")
+  endif()
+endforeach()
+
+# ---------------------------------------------------------------------------
 # nlohmann/json (header-only, system install at /usr/include/nlohmann)
 # ---------------------------------------------------------------------------
 find_package(nlohmann_json QUIET)
@@ -62,7 +83,7 @@ add_library(llm_alloc STATIC
 target_include_directories(llm_alloc PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(llm_alloc PUBLIC "${TORCH_LIBRARIES}")
+target_link_libraries(llm_alloc PUBLIC "${LLM_ALLOC_TORCH_LIBS}")
 if(nlohmann_json_FOUND)
   target_link_libraries(llm_alloc PUBLIC nlohmann_json::nlohmann_json)
 endif()
