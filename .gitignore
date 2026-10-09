@@ -1,0 +1,19 @@
+# Build output
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# Benchmark / sweep outputs
+benchmarks/
+benchmarks_cpp/
+benchmarks_py/
+sweeps/
+*.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
