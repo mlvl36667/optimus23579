@@ -114,9 +114,59 @@ if(nlohmann_json_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
+# Build-time metadata (injected into the llm_run banner).
+# Resolved at configure time from git; falls back to sensible defaults when
+# git or the repository metadata is unavailable.
+# ---------------------------------------------------------------------------
+find_package(Git QUIET)
+set(LLM_GIT_HASH "unknown")
+set(LLM_GIT_COMMITS "0")
+set(LLM_DEV_SINCE "unknown")
+set(LLM_DEVELOPER "unknown")
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+  execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE LLM_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" rev-list --count HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE LLM_GIT_COMMITS OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  # Date of the very first commit = "developed since".
+  execute_process(COMMAND "${GIT_EXECUTABLE}" log --reverse --format=%cs
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE _LLM_FIRST_DATES OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(_LLM_FIRST_DATES)
+    string(REGEX MATCH "^[^\n]+" LLM_DEV_SINCE "${_LLM_FIRST_DATES}")
+  endif()
+  # Developer = original author of the first commit.
+  execute_process(COMMAND "${GIT_EXECUTABLE}" log --reverse --format=%an
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE _LLM_AUTHORS OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(_LLM_AUTHORS)
+    string(REGEX MATCH "^[^\n]+" LLM_DEVELOPER "${_LLM_AUTHORS}")
+  endif()
+endif()
+
+string(TIMESTAMP LLM_BUILD_DATE "%Y-%m-%d %H:%M:%S" UTC)
+# Version: no project() version is set, so derive one from the commit count.
+set(LLM_VERSION "0.1.${LLM_GIT_COMMITS}")
+
+# ---------------------------------------------------------------------------
 # Executables
 # ---------------------------------------------------------------------------
 add_executable(llm_run       apps/run_main.cpp)
+target_compile_definitions(llm_run PRIVATE
+  LLM_DEVELOPER="${LLM_DEVELOPER}"
+  LLM_DEV_SINCE="${LLM_DEV_SINCE}"
+  LLM_VERSION="${LLM_VERSION}"
+  LLM_GIT_HASH="${LLM_GIT_HASH}"
+  LLM_BUILD_DATE="${LLM_BUILD_DATE}"
+  LLM_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+  LLM_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+)
 add_executable(llm_benchmark apps/benchmark_main.cpp)
 add_executable(llm_sweep     apps/sweep_main.cpp)
 foreach(_app llm_run llm_benchmark llm_sweep)

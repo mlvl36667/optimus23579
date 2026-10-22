@@ -4,11 +4,19 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <torch/torch.h>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 #include "llm_alloc/allocators.hpp"
 #include "llm_alloc/batched_simulator.hpp"
@@ -16,6 +24,32 @@
 #include "llm_alloc/learning.hpp"
 #include "llm_alloc/metrics.hpp"
 #include "llm_alloc/simulator.hpp"
+
+// ---------------------------------------------------------------------------
+// Build-time metadata (injected by CMake via target_compile_definitions).
+// Fallbacks keep the file compilable if built without those definitions.
+// ---------------------------------------------------------------------------
+#ifndef LLM_DEVELOPER
+#define LLM_DEVELOPER "unknown"
+#endif
+#ifndef LLM_DEV_SINCE
+#define LLM_DEV_SINCE "unknown"
+#endif
+#ifndef LLM_VERSION
+#define LLM_VERSION "0.0.0"
+#endif
+#ifndef LLM_GIT_HASH
+#define LLM_GIT_HASH "unknown"
+#endif
+#ifndef LLM_BUILD_DATE
+#define LLM_BUILD_DATE __DATE__ " " __TIME__
+#endif
+#ifndef LLM_COMPILER
+#define LLM_COMPILER "unknown"
+#endif
+#ifndef LLM_BUILD_TYPE
+#define LLM_BUILD_TYPE "unknown"
+#endif
 
 using namespace llm_alloc;
 
@@ -46,6 +80,130 @@ void usage() {
         "  --medium-gpus N       (default 2)\n"
         "  --large-gpus N        (default 1)\n"
         "  --json PATH           write metrics to a JSON file\n");
+}
+
+// ---------------------------------------------------------------------------
+// Host hardware introspection (best-effort, Linux-focused).
+// ---------------------------------------------------------------------------
+struct HostInfo {
+    unsigned hw_threads = 0;   // logical cores reported by the OS
+    long online_cpus = 0;      // sysconf online CPUs
+    double ram_total_gb = 0.0; // physical RAM
+    double ram_avail_gb = 0.0; // available RAM
+    int torch_threads = 0;     // intra-op threads LibTorch will use
+    int torch_interop = 0;     // inter-op threads LibTorch will use
+    std::string cpu_model;     // model name from /proc/cpuinfo
+};
+
+HostInfo probe_host() {
+    HostInfo h;
+    h.hw_threads = std::thread::hardware_concurrency();
+#if defined(__linux__)
+    h.online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_sz = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_sz > 0)
+        h.ram_total_gb = double(pages) * double(page_sz) / (1024.0 * 1024.0 * 1024.0);
+
+    // Available RAM and CPU model from /proc (optional, ignore if absent).
+    std::ifstream mem("/proc/meminfo");
+    std::string key;
+    while (mem >> key) {
+        if (key == "MemAvailable:") {
+            double kb = 0; mem >> kb;
+            h.ram_avail_gb = kb / (1024.0 * 1024.0);
+            break;
+        }
+        mem.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+    std::ifstream cpu("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(cpu, line)) {
+        if (line.rfind("model name", 0) == 0) {
+            auto pos = line.find(':');
+            if (pos != std::string::npos) {
+                h.cpu_model = line.substr(pos + 1);
+                size_t b = h.cpu_model.find_first_not_of(" \t");
+                if (b != std::string::npos) h.cpu_model = h.cpu_model.substr(b);
+            }
+            break;
+        }
+    }
+#endif
+    h.torch_threads = torch::get_num_threads();
+    h.torch_interop = torch::get_num_interop_threads();
+    return h;
+}
+
+// Print the startup banner: who/when/what/how/where.
+void print_banner(const Args& a) {
+    HostInfo h = probe_host();
+
+    std::time_t now = std::time(nullptr);
+    char now_buf[64] = {0};
+    std::strftime(now_buf, sizeof(now_buf), "%Y-%m-%d %H:%M:%S",
+                  std::localtime(&now));
+
+    const std::string bar(78, '=');
+    std::printf("%s\n", bar.c_str());
+    std::printf(
+        "   ___  ____ _____ ___ __  __ _   _ ____\n"
+        "  / _ \\|  _ \\_   _|_ _|  \\/  | | | / ___|\n"
+        " | | | | |_) || |  | || |\\/| | | | \\___ \\\n"
+        " | |_| |  __/ | |  | || |  | | |_| |___) |\n"
+        "  \\___/|_|    |_| |___|_|  |_|\\___/|____/   optimus23579\n");
+    std::printf("  LLM allocation RL simulator\n");
+    std::printf("%s\n", bar.c_str());
+
+    // --- Provenance ---
+    std::printf("  Developer        : %s\n", LLM_DEVELOPER);
+    std::printf("  Developed since  : %s\n", LLM_DEV_SINCE);
+    std::printf("  Version          : %s  (build %s, %s)\n",
+                LLM_VERSION, LLM_GIT_HASH, LLM_BUILD_TYPE);
+    std::printf("  Built            : %s UTC   [%s]\n",
+                LLM_BUILD_DATE, LLM_COMPILER);
+    std::printf("  Started          : %s (local)\n", now_buf);
+
+    // --- Launch configuration ---
+    std::printf("%s\n", std::string(78, '-').c_str());
+    std::printf("  Engine           : %s\n", a.engine.c_str());
+    std::printf("  Objective        : %s\n", a.objective.c_str());
+    std::printf("  Launch params    : n_prompts=%d  seed=%llu  episodes=%d\n",
+                a.n_prompts, (unsigned long long)a.seed, a.episodes);
+    std::printf("  GPU fleet        : small=%d  medium=%d  large=%d  (total %d)\n",
+                a.small_gpus, a.medium_gpus, a.large_gpus,
+                a.small_gpus + a.medium_gpus + a.large_gpus);
+    std::printf("  JSON output      : %s\n",
+                a.json_out.empty() ? "(none)" : a.json_out.c_str());
+
+    // --- What will be computed, and how ---
+    std::printf("%s\n", std::string(78, '-').c_str());
+    std::printf("  Task             : allocate %d prompts to (GPU, model) pairs,\n",
+                a.n_prompts);
+    std::printf("                     score each by reward = -(latency,energy,quality loss)\n");
+    std::printf("  Heuristics       : random, always_small, always_large, difficulty,\n");
+    std::printf("                     least_loaded, energy_aware\n");
+    std::printf("  Learners         : epsilon_greedy (bandit), q_learning (tabular TD),\n");
+    std::printf("                     dqn (LibTorch MLP, Double-DQN + replay)\n");
+    if (a.episodes > 0)
+        std::printf("  Training         : %d episodes per learner (convergence shown below)\n",
+                    a.episodes);
+    else
+        std::printf("  Training         : none (episodes=0) — learners run untrained\n");
+
+    // --- Hardware & parallelism (honest: this build is CPU-only, serial) ---
+    std::printf("%s\n", std::string(78, '-').c_str());
+    if (!h.cpu_model.empty())
+        std::printf("  CPU              : %s\n", h.cpu_model.c_str());
+    std::printf("  Logical cores    : %u (OS online: %ld)\n",
+                h.hw_threads, h.online_cpus);
+    std::printf("  RAM              : %.1f GB total, %.1f GB available\n",
+                h.ram_total_gb, h.ram_avail_gb);
+    std::printf("  Compute backend  : CPU only (no CUDA/GPU used)\n");
+    std::printf("  Parallelism      : single-threaded simulation; no OpenMP, no MPI\n");
+    std::printf("  LibTorch threads : intra-op=%d, inter-op=%d (used only inside DQN tensor ops)\n",
+                h.torch_threads, h.torch_interop);
+    std::printf("%s\n", bar.c_str());
 }
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -137,6 +295,81 @@ void write_json(const std::string& path, const Args& a,
     f << "  ]\n}\n";
 }
 
+// Final summary: a plain-language verdict on what the run produced.
+void print_run_summary(const Args& a,
+                       const std::vector<AggregatedMetrics>& metrics) {
+    const std::string bar(78, '=');
+    std::printf("\n%s\n", bar.c_str());
+    std::printf("  RUN SUMMARY\n");
+    std::printf("%s\n", bar.c_str());
+
+    if (metrics.empty()) {
+        std::printf("  No allocators were evaluated — nothing to report.\n");
+        std::printf("%s\n", bar.c_str());
+        return;
+    }
+
+    // Best (highest reward) and worst, plus totals.
+    const AggregatedMetrics* best = &metrics[0];
+    const AggregatedMetrics* worst = &metrics[0];
+    int total_jobs = 0, total_dropped = 0;
+    for (const auto& m : metrics) {
+        if (m.mean_reward > best->mean_reward) best = &m;
+        if (m.mean_reward < worst->mean_reward) worst = &m;
+        total_jobs += m.n_jobs;
+        total_dropped += m.dropped;
+    }
+
+    // Did the learners beat the heuristic field? Compare the best learner to
+    // the best heuristic by reward (names of the three learners are known).
+    auto is_learner_name = [](const std::string& n) {
+        return n == "epsilon_greedy" || n == "q_learning" || n == "dqn";
+    };
+    const AggregatedMetrics* best_learner = nullptr;
+    const AggregatedMetrics* best_heur = nullptr;
+    for (const auto& m : metrics) {
+        if (is_learner_name(m.allocator_name)) {
+            if (!best_learner || m.mean_reward > best_learner->mean_reward) best_learner = &m;
+        } else {
+            if (!best_heur || m.mean_reward > best_heur->mean_reward) best_heur = &m;
+        }
+    }
+
+    std::printf("  Status           : completed successfully\n");
+    std::printf("  Engine/objective : %s / %s\n", a.engine.c_str(), a.objective.c_str());
+    std::printf("  Allocators run   : %zu  (on %d prompts each)\n",
+                metrics.size(), a.n_prompts);
+    std::printf("  Training         : %s\n",
+                a.episodes > 0 ? "learners trained before evaluation"
+                               : "none (learners evaluated untrained)");
+    std::printf("  Prompts dropped  : %d (summed across allocators)\n", total_dropped);
+    std::printf("%s\n", std::string(78, '-').c_str());
+    std::printf("  Best  policy     : %-14s reward %8.3f | sys_energy %8.0fJ | quality %.3f\n",
+                best->allocator_name.c_str(), best->mean_reward,
+                best->system_energy, best->mean_quality);
+    std::printf("  Worst policy     : %-14s reward %8.3f | sys_energy %8.0fJ | quality %.3f\n",
+                worst->allocator_name.c_str(), worst->mean_reward,
+                worst->system_energy, worst->mean_quality);
+    if (best_learner && best_heur) {
+        std::printf("%s\n", std::string(78, '-').c_str());
+        std::printf("  Best learner     : %-14s reward %8.3f\n",
+                    best_learner->allocator_name.c_str(), best_learner->mean_reward);
+        std::printf("  Best heuristic   : %-14s reward %8.3f\n",
+                    best_heur->allocator_name.c_str(), best_heur->mean_reward);
+        if (best_learner->mean_reward > best_heur->mean_reward) {
+            std::printf("  Verdict          : the best learner BEAT the best heuristic "
+                        "(by %.3f reward).\n",
+                        best_learner->mean_reward - best_heur->mean_reward);
+        } else {
+            std::printf("  Verdict          : no learner beat the best heuristic "
+                        "(gap %.3f reward)%s.\n",
+                        best_heur->mean_reward - best_learner->mean_reward,
+                        a.episodes > 0 ? "" : " — try --episodes > 0 to train them");
+        }
+    }
+    std::printf("%s\n", bar.c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -152,7 +385,7 @@ int main(int argc, char** argv) {
     }
     std::vector<LLM> llm_pool = default_llm_pool();
 
-    std::printf("  Engine: %s\n", a.engine.c_str());
+    print_banner(a);
 
     // --- Learning allocators ---
     std::vector<std::unique_ptr<Allocator>> learners;
@@ -177,18 +410,33 @@ int main(int argc, char** argv) {
     }
 
     // --- Final evaluation on a common prompt stream ---
+    std::printf("\n%s\n", std::string(78, '=').c_str());
+    std::printf("  EVALUATION — all allocators on one shared stream of %d prompts\n",
+                a.n_prompts);
+    std::printf("%s\n", std::string(78, '=').c_str());
+
     PromptGenerator gen(0.5, 0.2, 1.0, 256, a.seed + 9999);
     std::vector<Prompt> prompts = gen.generate(a.n_prompts);
 
     std::vector<AggregatedMetrics> all_metrics;
 
     auto heuristics = all_heuristic_allocators(a.seed);
-    for (auto& alloc : heuristics) {
-        all_metrics.push_back(run_episode(a, weights, llm_pool, *alloc, prompts));
-    }
-    for (auto& learner : learners) {
-        all_metrics.push_back(run_episode(a, weights, llm_pool, *learner, prompts));
-    }
+    const size_t total_allocs = heuristics.size() + learners.size();
+    size_t done = 0;
+
+    auto run_and_log = [&](Allocator& alloc, const char* kind) {
+        std::printf("  [%2zu/%2zu] %-13s %-14s ... ",
+                    ++done, total_allocs, kind, alloc.name().c_str());
+        std::fflush(stdout);
+        AggregatedMetrics m = run_episode(a, weights, llm_pool, alloc, prompts);
+        std::printf("reward %8.3f | sys_energy %8.0fJ | quality %.3f | drop %d\n",
+                    m.mean_reward, m.system_energy, m.mean_quality, m.dropped);
+        std::fflush(stdout);
+        all_metrics.push_back(std::move(m));
+    };
+
+    for (auto& alloc : heuristics) run_and_log(*alloc, "heuristic");
+    for (auto& learner : learners) run_and_log(*learner, "learner");
 
     print_report(all_metrics, a.objective);
 
@@ -196,5 +444,8 @@ int main(int argc, char** argv) {
         write_json(a.json_out, a, all_metrics);
         std::printf("[INFO] metrics written to %s\n", a.json_out.c_str());
     }
+
+    // --- Final run summary: what happened, did it succeed, what we got ---
+    print_run_summary(a, all_metrics);
     return 0;
 }
