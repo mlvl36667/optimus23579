@@ -1,0 +1,32 @@
+{
+  "llama3.2:1b": {
+    "model": "llama3.2:1b",
+    "active_card": "NVIDIA GeForce RTX 3090",
+    "decode_tokens": 256,
+    "decode_seconds": 0.657,
+    "decode_tokens_per_s": 389.9,
+    "active_power_peak_w": 254.7,
+    "active_power_min_w": 130.7,
+    "energy_per_token_j": 0.6532
+  },
+  "llama3.2:3b": {
+    "model": "llama3.2:3b",
+    "active_card": "NVIDIA GeForce RTX 3090",
+    "decode_tokens": 256,
+    "decode_seconds": 1.09,
+    "decode_tokens_per_s": 234.8,
+    "active_power_peak_w": 338.4,
+    "active_power_min_w": 148.3,
+    "energy_per_token_j": 1.4414
+  },
+  "llama3.1:latest": {
+    "model": "llama3.1:latest",
+    "active_card": "NVIDIA GeForce RTX 3090",
+    "decode_tokens": 256,
+    "decode_seconds": 1.981,
+    "decode_tokens_per_s": 129.3,
+    "active_power_peak_w": 349.1,
+    "active_power_min_w": 190.6,
+    "energy_per_token_j": 2.7006
+  }
+}

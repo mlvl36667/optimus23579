@@ -126,6 +126,46 @@ Note that the CUDA device order (`cuda:0`, `cuda:1`) is by compute capability
 and need not match the `nvidia-smi` index order, so the script identifies cards
 by **name**, not index.
 
+### Model decode speed and energy (real LLMs via Ollama)
+
+The per-model constants — decode **speed** (`base_speed`, tokens/s) and
+**energy-per-token** (`energy_per_token`) in `default_llm_pool()` — are
+calibrated from three real quantised Llama models run through a local
+[Ollama](https://ollama.com) server using
+[`tools/measure_ollama.py`](tools/measure_ollama.py). It reads back Ollama's
+server-side decode token count and duration while sampling board power with
+`nvidia-smi`, and identifies the active card by GPU utilisation (Ollama ignores
+`CUDA_VISIBLE_DEVICES` on this host and always schedules onto the RTX 3090).
+
+Measured on the RTX 3090 (raw numbers in
+[`tools/ollama_measurements.json`](tools/ollama_measurements.json)):
+
+| Tier → model          | params | decode tok/s | J/token (on 3090) |
+|-----------------------|--------|--------------|-------------------|
+| `SMALL` ← llama3.2:1b  | 1B     | 390          | 0.65              |
+| `MEDIUM` ← llama3.2:3b | 3B     | 235          | 1.44              |
+| `LARGE` ← llama3.1:8b  | 8B     | 129          | 2.70              |
+
+`base_speed` is the measured tokens/s directly. `energy_per_token` is stored as
+the measured J/token **divided by the measurement card's `power_multiplier`**
+(the 3090 is the `LARGE` tier, ×1.4), because `compute_energy()` multiplies
+`energy_per_token · base_speed · power_multiplier` — so a model running on its
+matching tier reproduces the measured J/token. A model's `capability` (answer
+quality vs. prompt difficulty) is *not* decode physics and remains a stylised
+estimate.
+
+All three models were measured on the same card (the 3090), so the numbers
+capture how speed/energy scale **with model size**, holding the GPU fixed; the
+across-GPU scaling is covered by `measure_gpu.py` above. To re-measure:
+
+```bash
+ollama pull llama3.2:1b llama3.2:3b llama3.1:8b   # if not already local
+python3 tools/measure_ollama.py \
+    --models llama3.2:1b llama3.2:3b llama3.1:latest \
+    --json tools/ollama_measurements.json
+# then edit default_llm_pool() in src/domain.cpp accordingly
+```
+
 ## Dependencies
 
 - A C++17 compiler (tested with g++ 9.4) and CMake ≥ 3.18.

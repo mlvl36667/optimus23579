@@ -106,12 +106,28 @@ int GPU::kv_cache_slots(const LLM& llm) const {
 
 // ---------------------------------------------------------------------------
 // Default model pool
+//
+// CALIBRATION (see tools/measure_ollama.py, tools/ollama_measurements.json):
+// decode speed and energy-per-token are measured from three real Llama models
+// run through Ollama on the RTX 3090 (LARGE tier), decode-only timing:
+//   SMALL  <- llama3.2:1b   390 tok/s   0.653 J/tok (on 3090)
+//   MEDIUM <- llama3.2:3b   235 tok/s   1.441 J/tok (on 3090)
+//   LARGE  <- llama3.1:8b   129 tok/s   2.701 J/tok (on 3090)
+// base_speed is the measured tokens/s directly. energy_per_token is DIVIDED by
+// the measurement card's power_multiplier (3090 = LARGE = 1.4), because
+// compute_energy() multiplies energy_per_token * base_speed * power_multiplier:
+// storing J/tok-per-unit-multiplier lets the right tier reproduce the measured
+// J/tok when a model runs on its matching card.
+//   energy_per_token = measured_J_per_tok / 1.4
+// capability is NOT measured here (it models answer quality vs difficulty, not
+// decode physics) and remains a stylised estimate.
 // ---------------------------------------------------------------------------
 std::vector<LLM> default_llm_pool() {
     return {
-        LLM("SmallLM",  Size::SMALL,  0.35, 120.0, 0.005),
-        LLM("MediumLM", Size::MEDIUM, 0.65, 60.0,  0.015),
-        LLM("LargeLM",  Size::LARGE,  0.95, 25.0,  0.045),
+        //   name        size          capability  base_speed  energy_per_token
+        LLM("SmallLM",  Size::SMALL,  0.35,       390.0,      0.467),   // llama3.2:1b
+        LLM("MediumLM", Size::MEDIUM, 0.65,       235.0,      1.029),   // llama3.2:3b
+        LLM("LargeLM",  Size::LARGE,  0.95,       129.0,      1.929),   // llama3.1:8b
     };
 }
 
