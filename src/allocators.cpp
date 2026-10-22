@@ -19,6 +19,54 @@ size_t rand_index(std::mt19937_64& rng, size_t n) {
     std::uniform_int_distribution<size_t> dist(0, n - 1);
     return dist(rng);
 }
+
+// State-aware GPU choice among a set of candidate GPUs (all already known to
+// fit the chosen model).  A real scheduler never places work on a random GPU:
+// it avoids waking sleepers when a live GPU is available, and otherwise sends
+// the job to the least-loaded one.  Preference order:
+//   1. Prefer GPUs that are NOT asleep (avoid paying wake-up latency/energy),
+//      unless every candidate is asleep.
+//   2. Among the preferred set, pick the least-loaded: on the batched engine
+//      that is the lowest batch-fill (most free KV-cache), tie-broken by the
+//      earliest busy_until; on the static engine it is simply the earliest
+//      busy_until.
+// Returns nullptr only if candidates is empty.
+GPU* pick_gpu(const std::vector<GPU*>& candidates, const EnvObservation* env) {
+    if (candidates.empty()) return nullptr;
+
+    // Is a GPU asleep? Only knowable from the env observation (batched engine).
+    auto is_asleep = [&](const GPU* g) -> bool {
+        if (!env) return false;
+        const GPUObservation* o = env->get(g->id);
+        return o && o->power_state == "sleep";
+    };
+
+    bool any_awake = false;
+    for (const GPU* g : candidates) if (!is_asleep(g)) { any_awake = true; break; }
+
+    GPU* best = nullptr;
+    double best_fill = 0.0;
+    double best_busy = 0.0;
+    for (GPU* g : candidates) {
+        if (any_awake && is_asleep(g)) continue;  // skip sleepers while awake exist
+
+        double fill = 0.0;
+        if (env) {
+            const GPUObservation* o = env->get(g->id);
+            if (o) fill = o->batch_fill();
+        }
+        double busy = g->busy_until;
+
+        if (!best ||
+            fill < best_fill - 1e-9 ||
+            (std::abs(fill - best_fill) <= 1e-9 && busy < best_busy)) {
+            best = g;
+            best_fill = fill;
+            best_busy = busy;
+        }
+    }
+    return best;
+}
 }  // namespace
 
 std::vector<AllocationDecision> valid_pairs(std::vector<GPU>& gpus,
@@ -48,7 +96,7 @@ AlwaysSmallAllocator::AlwaysSmallAllocator(std::optional<uint64_t> seed) : rng_(
 
 std::optional<AllocationDecision> AlwaysSmallAllocator::allocate(
     const Prompt&, std::vector<GPU>& gpus, const std::vector<LLM>& llm_pool,
-    double, const EnvObservation*) {
+    double, const EnvObservation* env) {
     const LLM* small = nullptr;
     for (const LLM& m : llm_pool) {
         if (m.size == Size::SMALL) { small = &m; break; }
@@ -56,8 +104,9 @@ std::optional<AllocationDecision> AlwaysSmallAllocator::allocate(
     if (!small) return std::nullopt;
     std::vector<GPU*> ok;
     for (GPU& g : gpus) if (small->fits_on(g)) ok.push_back(&g);
-    if (ok.empty()) return std::nullopt;
-    return AllocationDecision(ok[rand_index(rng_, ok.size())], *small);
+    GPU* gpu = pick_gpu(ok, env);
+    if (!gpu) return std::nullopt;
+    return AllocationDecision(gpu, *small);
 }
 
 // --- AlwaysLarge ---
@@ -65,7 +114,7 @@ AlwaysLargeAllocator::AlwaysLargeAllocator(std::optional<uint64_t> seed) : rng_(
 
 std::optional<AllocationDecision> AlwaysLargeAllocator::allocate(
     const Prompt&, std::vector<GPU>& gpus, const std::vector<LLM>& llm_pool,
-    double, const EnvObservation*) {
+    double, const EnvObservation* env) {
     const LLM* large = nullptr;
     for (const LLM& m : llm_pool) {
         if (m.size == Size::LARGE) { large = &m; break; }
@@ -73,8 +122,9 @@ std::optional<AllocationDecision> AlwaysLargeAllocator::allocate(
     if (!large) return std::nullopt;
     std::vector<GPU*> ok;
     for (GPU& g : gpus) if (large->fits_on(g)) ok.push_back(&g);
-    if (ok.empty()) return std::nullopt;
-    return AllocationDecision(ok[rand_index(rng_, ok.size())], *large);
+    GPU* gpu = pick_gpu(ok, env);
+    if (!gpu) return std::nullopt;
+    return AllocationDecision(gpu, *large);
 }
 
 // --- DifficultyAllocator ---
@@ -82,7 +132,7 @@ DifficultyAllocator::DifficultyAllocator(std::optional<uint64_t> seed) : rng_(ma
 
 std::optional<AllocationDecision> DifficultyAllocator::allocate(
     const Prompt& prompt, std::vector<GPU>& gpus, const std::vector<LLM>& llm_pool,
-    double, const EnvObservation*) {
+    double, const EnvObservation* env) {
     constexpr double t0 = 0.35, t1 = 0.70;
     Size target;
     if (prompt.difficulty < t0) target = Size::SMALL;
@@ -96,8 +146,9 @@ std::optional<AllocationDecision> DifficultyAllocator::allocate(
     if (!chosen) return std::nullopt;
     std::vector<GPU*> ok;
     for (GPU& g : gpus) if (chosen->fits_on(g)) ok.push_back(&g);
-    if (ok.empty()) return std::nullopt;
-    return AllocationDecision(ok[rand_index(rng_, ok.size())], *chosen);
+    GPU* gpu = pick_gpu(ok, env);
+    if (!gpu) return std::nullopt;
+    return AllocationDecision(gpu, *chosen);
 }
 
 // --- LeastLoadedAllocator ---
