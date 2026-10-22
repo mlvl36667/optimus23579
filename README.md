@@ -1,4 +1,4 @@
-# Dispensator
+# optimus23579
 
 A C++17 reinforcement-learning simulator that allocates incoming LLM prompts
 across a heterogeneous GPU fleet, jointly optimising latency, energy, and answer
