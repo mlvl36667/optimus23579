@@ -1,0 +1,20 @@
+{
+  "NVIDIA GeForce RTX 3090": {
+    "torch_index": 0,
+    "vram_gib": 23.8,
+    "sm_count": 82,
+    "idle_power_w": 128.5,
+    "active_power_w": 349.4,
+    "active_power_mean_w": 313.9,
+    "gemm_tflops_fp16": 64.0
+  },
+  "NVIDIA GeForce RTX 3070 Ti": {
+    "torch_index": 1,
+    "vram_gib": 7.9,
+    "sm_count": 48,
+    "idle_power_w": 74.1,
+    "active_power_w": 249.4,
+    "active_power_mean_w": 228.5,
+    "gemm_tflops_fp16": 43.3
+  }
+}

@@ -17,26 +17,39 @@ const char* size_name(Size s) {
 
 // ---------------------------------------------------------------------------
 // GPU energy/latency properties (keyed by VRAM tier)
+//
+// CALIBRATION (see tools/measure_gpu.py, tools/gpu_measurements.json):
+//   SMALL  <- NVIDIA RTX 3070 Ti (8 GB)  : idle 74 W, active 249 W, 43 TFLOP/s
+//   LARGE  <- NVIDIA RTX 3090   (24 GB)  : idle 128 W, active 349 W, 64 TFLOP/s
+//   MEDIUM <- interpolated between the two (no physical card for this tier)
+// Values marked "measured" come from nvidia-smi power sampling under a
+// sustained FP16 GEMM load on this host; values marked "estimated" (sleep
+// power, wake-up latency/energy, KV-cache slots) could not be measured with
+// this setup and remain stylised.
 // ---------------------------------------------------------------------------
 double GPU::power_multiplier() const {
+    // Ratio of measured active board power to the SMALL tier (249 W):
+    //   3070 Ti 249/249 = 1.00 ; 3090 349/249 = 1.40 ; MEDIUM interpolated.
     switch (vram) {
         case Size::SMALL: return 1.0;
-        case Size::MEDIUM: return 1.6;
-        case Size::LARGE: return 2.5;
+        case Size::MEDIUM: return 1.2;
+        case Size::LARGE: return 1.4;
     }
     return 1.0;
 }
 
 double GPU::idle_power() const {
+    // measured (p50 idle, nvidia-smi); MEDIUM interpolated.
     switch (vram) {
-        case Size::SMALL: return 15.0;
-        case Size::MEDIUM: return 35.0;
-        case Size::LARGE: return 75.0;
+        case Size::SMALL: return 74.0;   // RTX 3070 Ti
+        case Size::MEDIUM: return 100.0; // interpolated
+        case Size::LARGE: return 128.0;  // RTX 3090
     }
-    return 15.0;
+    return 74.0;
 }
 
 double GPU::sleep_power() const {
+    // estimated (not measured): a suspended GPU with VRAM cleared draws little.
     switch (vram) {
         case Size::SMALL: return 2.0;
         case Size::MEDIUM: return 4.0;
@@ -46,6 +59,7 @@ double GPU::sleep_power() const {
 }
 
 double GPU::wake_up_latency() const {
+    // estimated (not measured): time to resume + reload weights into VRAM.
     switch (vram) {
         case Size::SMALL: return 2.0;
         case Size::MEDIUM: return 5.0;
@@ -55,6 +69,7 @@ double GPU::wake_up_latency() const {
 }
 
 double GPU::wake_up_energy() const {
+    // estimated (not measured): one-off energy to wake + reload.
     switch (vram) {
         case Size::SMALL: return 150.0;
         case Size::MEDIUM: return 600.0;
@@ -64,12 +79,13 @@ double GPU::wake_up_energy() const {
 }
 
 double GPU::active_power() const {
+    // measured (peak board power under sustained GEMM); MEDIUM interpolated.
     switch (vram) {
-        case Size::SMALL: return 70.0;
-        case Size::MEDIUM: return 200.0;
-        case Size::LARGE: return 450.0;
+        case Size::SMALL: return 249.0;  // RTX 3070 Ti
+        case Size::MEDIUM: return 300.0; // interpolated
+        case Size::LARGE: return 349.0;  // RTX 3090
     }
-    return 70.0;
+    return 249.0;
 }
 
 int GPU::kv_cache_slots(const LLM& llm) const {

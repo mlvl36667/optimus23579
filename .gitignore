@@ -12,6 +12,9 @@ benchmarks_py/
 sweeps/
 *.json
 
+# ...but the GPU calibration data is intentionally version-controlled.
+!tools/gpu_measurements.json
+
 # Editor / OS
 .vscode/
 .idea/

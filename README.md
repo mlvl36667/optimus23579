@@ -89,6 +89,43 @@ value-based ones, extend the engine to **multi-node / networked** fleets, and
 replace the stylised quality model with one fit to actual model-vs-difficulty
 behaviour.
 
+## Calibration against real GPUs
+
+The GPU **power** constants are no longer arbitrary — they are calibrated
+against two physical cards in the development host using
+[`tools/measure_gpu.py`](tools/measure_gpu.py). That script needs only a
+CUDA-capable PyTorch and the `nvidia-smi` binary (no `pynvml`, `transformers`,
+or internet): it samples board power with `nvidia-smi` while driving each card
+with a sustained FP16 GEMM (a stand-in for the dense matmuls that dominate LLM
+decode), and reports idle power, active power, and sustained TFLOP/s.
+
+Measured on this host (raw numbers in
+[`tools/gpu_measurements.json`](tools/gpu_measurements.json)):
+
+| Tier → card         | VRAM  | idle W | active W | FP16 TFLOP/s |
+|---------------------|-------|--------|----------|--------------|
+| `SMALL` ← RTX 3070 Ti | 8 GB  | 74     | 249      | 43           |
+| `LARGE` ← RTX 3090    | 24 GB | 128    | 349      | 64           |
+| `MEDIUM`              | —     | 100    | 300      | —            |
+
+These feed `GPU::idle_power()`, `GPU::active_power()` and
+`GPU::power_multiplier()` in `src/domain.cpp`. The `MEDIUM` tier has no physical
+card, so its values are **interpolated** between the two measured cards. The
+remaining constants that this setup cannot measure — `sleep_power`,
+`wake_up_latency`, `wake_up_energy`, and the KV-cache slot counts — are left as
+**estimates** and are commented as such in the source.
+
+To re-measure on a different machine:
+
+```bash
+python3 tools/measure_gpu.py --json tools/gpu_measurements.json
+# then edit the measured() constants in src/domain.cpp accordingly
+```
+
+Note that the CUDA device order (`cuda:0`, `cuda:1`) is by compute capability
+and need not match the `nvidia-smi` index order, so the script identifies cards
+by **name**, not index.
+
 ## Dependencies
 
 - A C++17 compiler (tested with g++ 9.4) and CMake ≥ 3.18.
