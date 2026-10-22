@@ -370,6 +370,60 @@ void print_run_summary(const Args& a,
     std::printf("%s\n", bar.c_str());
 }
 
+// Evaluate every allocator under each objective profile on the SAME prompt
+// stream, and report which policy wins each profile. Rewards are NOT comparable
+// across profiles (different weightings), so we only pick the best WITHIN each.
+void print_profile_winners(const Args& a, const std::vector<LLM>& llm_pool,
+                           const std::vector<Prompt>& prompts,
+                           std::vector<std::unique_ptr<Allocator>>& heuristics,
+                           std::vector<std::unique_ptr<Allocator>>& learners) {
+    const char* profiles[] = {"energy", "balanced", "quality", "latency"};
+    const std::string bar(78, '=');
+    std::printf("\n%s\n", bar.c_str());
+    std::printf("  OBJECTIVE-PROFILE WINNERS  (same %d prompts, each profile judged on its own reward)\n",
+                a.n_prompts);
+    std::printf("%s\n", bar.c_str());
+    std::printf("  %-10s | %-14s | %10s | %10s | %8s\n",
+                "profile", "winner", "reward", "sys_energy", "quality");
+    std::printf("%s\n", std::string(78, '-').c_str());
+
+    for (const char* prof : profiles) {
+        RewardWeights w;
+        try {
+            w = RewardWeights::profile(prof);
+        } catch (const std::exception&) {
+            continue;
+        }
+
+        const AggregatedMetrics* best = nullptr;
+        AggregatedMetrics best_copy;
+        auto consider = [&](Allocator& alloc) {
+            AggregatedMetrics m = run_episode(a, w, llm_pool, alloc, prompts);
+            if (!best || m.mean_reward > best_copy.mean_reward) {
+                best_copy = m;
+                best = &best_copy;
+            }
+        };
+        for (auto& h : heuristics) consider(*h);
+        for (auto& l : learners) consider(*l);
+
+        if (best) {
+            std::printf("  %-10s | %-14s | %10.3f | %9.0fJ | %8.3f\n",
+                        prof, best_copy.allocator_name.c_str(),
+                        best_copy.mean_reward, best_copy.system_energy,
+                        best_copy.mean_quality);
+        }
+    }
+    std::printf("%s\n", std::string(78, '-').c_str());
+    if (a.episodes > 0)
+        std::printf("  Note: learners were trained on the '%s' profile only; their scores\n"
+                    "        under other profiles reflect that fixed policy, not retraining.\n",
+                    a.objective.c_str());
+    else
+        std::printf("  Note: learners are untrained here (episodes=0).\n");
+    std::printf("%s\n", bar.c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -447,5 +501,8 @@ int main(int argc, char** argv) {
 
     // --- Final run summary: what happened, did it succeed, what we got ---
     print_run_summary(a, all_metrics);
+
+    // --- Cross-profile winners: which policy wins energy/balanced/quality/latency ---
+    print_profile_winners(a, llm_pool, prompts, heuristics, learners);
     return 0;
 }
