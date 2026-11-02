@@ -1,6 +1,6 @@
 # optimus23579
 
-A C++17 reinforcement-learning simulator that allocates incoming LLM prompts
+A C++20 reinforcement-learning simulator that allocates incoming LLM prompts
 across a heterogeneous GPU fleet, jointly optimising latency, energy, and answer
 quality. Uses **LibTorch** for the DQN allocator and **nlohmann/json** for JSON
 export.
@@ -168,20 +168,21 @@ python3 tools/measure_ollama.py \
 
 ## Dependencies
 
-- A C++17 compiler (tested with g++ 9.4) and CMake ≥ 3.18.
-- **LibTorch** 2.4.1 (CPU). The build prefers a CPU-only LibTorch at
-  `$HOME/.local/lib/libtorch`; otherwise it falls back to the `torch` pip
-  package. Override explicitly with `-DTorch_DIR=/path/to/share/cmake/Torch`.
-  The project uses `TORCH_CXX_FLAGS` to match the installed Torch C++ ABI.
+- A C++20 compiler and CMake ≥ 3.18.
+- **LibTorch** (CPU build). The project requires C++20 to match current
+  PyTorch C++ headers and uses `TORCH_CXX_FLAGS` to match the installed Torch
+  ABI. Prefer the CPU-only PyTorch wheel; CUDA-enabled wheels require a matching
+  CUDA toolkit even though this project runs on CPU.
 - **nlohmann/json** (header-only; the system install at `/usr/include` is used
   for the benchmark/sweep JSON export).
 
 ## Build
 
-On Debian/Ubuntu, install the JSON development dependency:
+On Debian/Ubuntu, install the compiler, CMake, Python virtual-environment
+support, and JSON development dependency:
 
 ```bash
-sudo apt install nlohmann-json3-dev
+sudo apt install build-essential cmake python3-venv nlohmann-json3-dev
 ```
 
 If LibTorch is not already installed, install CPU PyTorch in a virtual
@@ -190,21 +191,25 @@ environment from the repository root:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-On Debian/Ubuntu, install `python3-venv` if virtual environment creation fails.
-CMake detects Torch using the active Python environment. You can select an
-interpreter explicitly with `-DPython3_EXECUTABLE=/absolute/path/to/.venv/bin/python`.
-Alternatively, pass `-DTorch_DIR=/path/to/torch/share/cmake/Torch`.
-
-From the repository root, configure and build (only build after configuration succeeds):
+Configure from the repository root and explicitly bind CMake to the virtual
+environment's Torch package. A separate build directory avoids stale cache
+entries from a prior CUDA-enabled Torch installation:
 
 ```bash
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j4
+source .venv/bin/activate
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release \
+  -DTorch_DIR="$PWD/.venv/lib/python3.10/site-packages/torch/share/cmake/Torch" \
+  -DCMAKE_PREFIX_PATH="$PWD/.venv/lib/python3.10/site-packages/torch"
+cmake --build build-cpu -j4
 ```
+
+If using a Python version other than 3.10, replace `python3.10` in the Torch
+paths with that version's `pythonX.Y` directory. Resolve configuration errors
+before building; a failed configure does not generate build files.
 
 ## Run
 

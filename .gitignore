@@ -1,6 +1,7 @@
 # Build output
 .venv/
 build/
+build-cpu/
 cmake-build-*/
 *.o
 *.a
