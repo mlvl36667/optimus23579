@@ -99,6 +99,12 @@ set(LLM_ALLOC_TORCH_LIBS "${TORCH_LIBRARIES}")
 # nlohmann/json (header-only, system install at /usr/include/nlohmann)
 # ---------------------------------------------------------------------------
 find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+  message(FATAL_ERROR
+    "nlohmann/json is required. On Debian/Ubuntu install it with:\n"
+    "  sudo apt install nlohmann-json3-dev\n"
+    "Then rerun CMake. For a custom installation, set nlohmann_json_DIR.")
+endif()
 
 # ---------------------------------------------------------------------------
 # Core library

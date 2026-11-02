@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <stdexcept>
 
 namespace llm_alloc {
 
@@ -33,13 +34,6 @@ double step_power(const GPU& gpu, int batch_size, int max_batch) {
 // ---------------------------------------------------------------------------
 namespace {
 
-struct Transition {
-    std::shared_ptr<DecisionSnapshot> decision;
-    double reward;
-    bool done;
-    double holding_time;
-};
-
 struct Sequence {
     Prompt prompt;
     LLM llm;
@@ -47,7 +41,7 @@ struct Sequence {
     double generated = 0.0;
     double admitted_time = 0.0;
     double overhead_energy = 0.0;
-    std::shared_ptr<DecisionSnapshot> decision;
+    double active_energy = 0.0;
 
     bool done() const { return generated >= target_tokens; }
 };
@@ -112,20 +106,35 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
         states.emplace(g.id, std::move(st));
     }
 
-    std::sort(prompts.begin(), prompts.end(),
+    std::stable_sort(prompts.begin(), prompts.end(),
               [](const Prompt& a, const Prompt& b) { return a.arrival_time < b.arrival_time; });
     size_t pending_idx = 0;
 
     std::vector<JobResult> results;
     dropped = 0;
     total_idle_energy = 0.0;
+    active_energy = idle_energy = sleep_energy = wake_energy = accounting_error = 0.0;
 
     double t = 0.0;
-    std::vector<Transition> pending_transitions;
+    arrival_transitions.clear();
+    if (prompts.empty()) return results;
+    std::shared_ptr<DecisionSnapshot> previous_decision;
+    bool previous_arrival = false;
+    double previous_time = 0.0;
+    double previous_energy = 0.0;
+    double interval_service_cost = 0.0;
 
-    bool has_observe = allocator.supports_observe_transition();
-    // pop_last_decision is a learner hook; we call it only for learners.
-    bool is_learner = allocator.is_learner();
+    auto fleet_energy = [&]() { return active_energy + idle_energy + sleep_energy + wake_energy; };
+    auto emit_transition = [&](const std::shared_ptr<DecisionSnapshot>& successor, bool terminal) {
+        if (!previous_arrival) return;
+        double energy = fleet_energy() - previous_energy;
+        double reward = -(cfg.reward_weights.energy * energy + interval_service_cost);
+        arrival_transitions.push_back({energy, interval_service_cost, reward, t - previous_time, terminal});
+        if (online_update && allocator.is_learner())
+            allocator.observe_arrival_transition(previous_decision, reward, successor, terminal, t - previous_time);
+        previous_energy = fleet_energy();
+        interval_service_cost = 0.0;
+    };
 
     auto all_empty = [&]() {
         for (auto& kv : states) {
@@ -140,6 +149,7 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
         st.wake_ready_at = t + st.gpu->wake_up_latency();
         st.loaded_llm.reset();
         st.energy += st.gpu->wake_up_energy();
+        wake_energy += st.gpu->wake_up_energy();
     };
 
     // helper: admit waiting sequences into active batch up to capacity
@@ -170,14 +180,17 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
         }
         if (!cfg.power_management) {
             st.energy += st.gpu->idle_power() * cfg.dt;
+            idle_energy += st.gpu->idle_power() * cfg.dt;
             return;
         }
         if (st.power_state == "waking") {
             st.energy += st.gpu->idle_power() * cfg.dt;
+            idle_energy += st.gpu->idle_power() * cfg.dt;
             return;
         }
         if (st.power_state == "sleep") {
             st.energy += st.gpu->sleep_power() * cfg.dt;
+            sleep_energy += st.gpu->sleep_power() * cfg.dt;
             return;
         }
         if (st.power_state != "idle") {
@@ -185,6 +198,7 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
             st.idle_since = t;
         }
         st.energy += st.gpu->idle_power() * cfg.dt;
+        idle_energy += st.gpu->idle_power() * cfg.dt;
         if (t - st.idle_since >= cfg.sleep_timeout) {
             st.power_state = "sleep";
             st.loaded_llm.reset();
@@ -192,16 +206,14 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
     };
 
     // helper: make a JobResult from a finished sequence
-    auto make_result = [&](const Sequence& seq, GPU& gpu, double end_time,
-                           double energy_per_token) -> JobResult {
+    auto make_result = [&](const Sequence& seq, GPU& gpu, double end_time) -> JobResult {
         const RewardWeights& w = cfg.reward_weights;
         const Prompt& prompt = seq.prompt;
         const LLM& llm = seq.llm;
 
         double latency = end_time - prompt.arrival_time;
         double processing_time = end_time - seq.admitted_time;
-        double active_energy = energy_per_token * seq.target_tokens;
-        double energy = active_energy + seq.overhead_energy;
+        double energy = seq.active_energy + seq.overhead_energy;
         double quality = compute_quality(prompt, llm);
         double quality_loss = 1.0 - quality;
 
@@ -241,23 +253,28 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
 
         double power = step_power(gpu, batch_size, max_batch);
         st.energy += power * cfg.dt;
+        active_energy += power * cfg.dt;
         st.busy_ticks += 1;
 
-        for (Sequence& seq : st.active) seq.generated += tokens_this_tick;
+        for (Sequence& seq : st.active) {
+            seq.generated += tokens_this_tick;
+            seq.active_energy += power * cfg.dt / batch_size;
+        }
+    };
 
-        double total_tokens_this_tick = tokens_this_tick * batch_size;
-        double energy_per_token = (power * cfg.dt) / std::max(1e-9, total_tokens_this_tick);
-
+    auto finish_sequences = [&](GPUState& st) {
+        GPU& gpu = *st.gpu;
         double end_time = t + cfg.dt;
         // Collect finished sequences, build results, then erase.
         for (auto it = st.active.begin(); it != st.active.end();) {
             if (it->done()) {
                 gpu.jobs_completed += 1;
-                JobResult result = make_result(*it, gpu, end_time, energy_per_token);
+                JobResult result = make_result(*it, gpu, end_time);
                 results.push_back(result);
-                double holding_time = std::max(0.0, end_time - it->admitted_time);
-                pending_transitions.push_back(
-                    Transition{it->decision, result.reward, false, holding_time});
+                const auto& weights = cfg.reward_weights;
+                interval_service_cost += weights.latency * result.latency +
+                    weights.quality_loss * result.quality_loss + weights.min_quality_penalty *
+                    std::max(0.0, weights.min_quality - result.quality);
                 it = st.active.erase(it);
             } else {
                 ++it;
@@ -271,7 +288,12 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
             const Prompt& prompt = prompts[pending_idx];
             pending_idx++;
             EnvObservation env_state = observe(states, t);
+            auto successor = allocator.arrival_state(prompt, gpus_, t, &env_state);
+            emit_transition(successor, false);
             auto decision = allocator.allocate(prompt, gpus_, llm_pool_, t, &env_state);
+            previous_decision = allocator.pop_last_decision();
+            previous_arrival = true;
+            previous_time = t;
             if (!decision.has_value() || decision->gpu == nullptr ||
                 !decision->llm.fits_on(*decision->gpu)) {
                 dropped++;
@@ -284,9 +306,6 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
             seq.llm = decision->llm;
             seq.target_tokens = target;
             seq.admitted_time = t;
-            if (is_learner) {
-                seq.decision = allocator.pop_last_decision();
-            }
             st.waiting.push_back(std::move(seq));
             if (cfg.power_management && st.power_state == "sleep") {
                 begin_wake(st);
@@ -315,17 +334,11 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
         for (auto& kv : states) decode_step(kv.second);
 
         // 5) Power-state bookkeeping + non-active energy
+        double overhead_before = idle_energy + sleep_energy;
         for (auto& kv : states) tick_power(kv.second);
 
         // 5b) Attribute this tick's overhead energy across in-flight sequences
-        double overhead = 0.0;
-        for (auto& kv : states) {
-            GPUState& st = kv.second;
-            if (st.active.empty()) {
-                if (st.power_state == "sleep") overhead += st.gpu->sleep_power() * cfg.dt;
-                else overhead += st.gpu->idle_power() * cfg.dt;
-            }
-        }
+        double overhead = idle_energy + sleep_energy - overhead_before;
         std::vector<Sequence*> in_flight;
         for (auto& kv : states) {
             for (Sequence& s : kv.second.active) in_flight.push_back(&s);
@@ -334,30 +347,18 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
             double share = overhead / in_flight.size();
             for (Sequence* s : in_flight) s->overhead_energy += share;
         }
+        for (auto& entry : states) finish_sequences(entry.second);
 
         // 6) Online learner feedback
         bool episode_over = (pending_idx >= prompts.size()) && all_empty();
-        if (online_update && !pending_transitions.empty()) {
-            EnvObservation next_state = observe(states, t + cfg.dt);
-            if (has_observe) {
-                for (Transition& tr : pending_transitions) {
-                    bool done = tr.done || episode_over;
-                    allocator.observe_transition(tr.decision, tr.reward, &next_state,
-                                                 done, tr.holding_time);
-                }
-            } else if (is_learner) {
-                for (Transition& tr : pending_transitions) {
-                    allocator.update(tr.reward);
-                }
-            }
-            pending_transitions.clear();
-        }
 
         // 7) Advance time / termination
         t += cfg.dt;
         if (episode_over) break;
-        if (t > cfg.max_sim_time) break;
+        if (t > cfg.max_sim_time)
+            throw std::runtime_error("Batched simulation time limit reached before fleet drain; no terminal transition emitted");
     }
+    emit_transition(nullptr, true);
 
     // Energy accounting
     double total_gpu_energy = 0.0;
@@ -365,6 +366,15 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
     double job_energy = 0.0;
     for (const JobResult& r : results) job_energy += r.energy;
     total_idle_energy = std::max(0.0, total_gpu_energy - job_energy);
+    accounting_error = total_gpu_energy - (active_energy + idle_energy + sleep_energy + wake_energy);
+    if (!results.empty()) {
+        double residual_share = total_idle_energy / results.size();
+        for (auto& result : results) {
+            result.energy += residual_share;
+            result.reward -= cfg.reward_weights.energy * residual_share;
+        }
+        total_idle_energy = 0.0;
+    }
     return results;
 }
 

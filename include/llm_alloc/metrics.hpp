@@ -16,8 +16,8 @@ struct AggregatedMetrics {
     double mean_reward = 0.0;
     double mean_latency = 0.0;
     double p95_latency = 0.0;
-    double total_energy = 0.0;      // active inference energy
-    double idle_energy = 0.0;       // GPU idle energy
+    double total_energy = 0.0;
+    double idle_energy = 0.0;
     double system_energy = 0.0;     // total_energy + idle_energy
     double mean_energy = 0.0;
     double mean_quality = 0.0;

@@ -14,7 +14,7 @@ std::string AggregatedMetrics::summary_line() const {
     char buf[256];
     std::snprintf(buf, sizeof(buf),
         "%-20s | reward %8.3f | latency %7.2fs (p95 %7.2fs) | "
-        "energy %9.1fJ (%.0f active + %.0f idle) | quality %.3f | GPU-util %.1f%%",
+        "energy %9.1fJ (%.0f attributed + %.0f residual) | quality %.3f | GPU-util %.1f%%",
         allocator_name.c_str(), mean_reward, mean_latency, p95_latency,
         system_energy, total_energy, idle_energy, mean_quality, util_avg * 100.0);
     return std::string(buf);
@@ -29,7 +29,8 @@ AggregatedMetrics aggregate(const std::string& allocator_name,
     m.dropped = dropped;
 
     if (results.empty()) {
-        m.idle_energy = 0.0;
+        m.idle_energy = idle_energy;
+        m.system_energy = idle_energy;
         return m;
     }
 

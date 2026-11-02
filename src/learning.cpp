@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <set>
+#include <stdexcept>
 
 #include "llm_alloc/domain.hpp"
 #include "llm_alloc/metrics.hpp"
@@ -224,14 +225,18 @@ std::optional<AllocationDecision> EpsilonGreedyAllocator::allocate(
 
     int chosen_size;
     std::uniform_real_distribution<double> uni(0.0, 1.0);
-    if (uni(rng_) < epsilon_) {
+    if (!evaluation_mode && uni(rng_) < epsilon_) {
         std::uniform_int_distribution<size_t> pick(0, available_sizes.size() - 1);
         chosen_size = available_sizes[pick(rng_)];
     } else {
         chosen_size = available_sizes[0];
-        double best = q_[{d_bin, chosen_size}];
+        auto value = [&](int size) {
+            auto found = q_.find({d_bin, size});
+            return found == q_.end() ? 0.0 : found->second;
+        };
+        double best = value(chosen_size);
         for (int sv : available_sizes) {
-            double v = q_[{d_bin, sv}];
+            double v = value(sv);
             if (v > best) { best = v; chosen_size = sv; }
         }
     }
@@ -250,6 +255,7 @@ std::optional<AllocationDecision> EpsilonGreedyAllocator::allocate(
 }
 
 void EpsilonGreedyAllocator::update(double reward) {
+    if (evaluation_mode) return;
     if (!last_key_.has_value()) return;
     auto key = *last_key_;
     counts_[key] += 1;
@@ -279,10 +285,35 @@ void QLearningAllocator::reset_for_episode() {
     pending_decision_.reset();
 }
 
+namespace {
+std::pair<int, int> tabular_batch_bins(const EnvObservation& observation,
+                                     int load_bins, int batch_bins) {
+    int occupied = 0;
+    bool waiting = false;
+    double peak_fill = 0.0;
+    for (const auto& entry : observation.gpus) {
+        const auto& gpu = entry.second;
+        if (gpu.active_count > 0 || gpu.waiting_count > 0) ++occupied;
+        waiting = waiting || gpu.waiting_count > 0;
+        double fill = static_cast<double>(std::max(0, gpu.active_count)) / std::max(1, gpu.capacity);
+        peak_fill = std::max(peak_fill, std::min(1.0, fill));
+    }
+    double load = static_cast<double>(occupied) / std::max<size_t>(1, observation.gpus.size());
+    int load_bin = waiting ? std::max(0, load_bins - 1) :
+        static_cast<int>(std::ceil(load * std::max(0, load_bins - 1)));
+    int batch_bin = static_cast<int>(std::ceil(peak_fill * std::max(0, batch_bins - 1)));
+    return {load_bin, batch_bin};
+}
+}
+
 QLearningAllocator::State QLearningAllocator::get_state(
     const Prompt& prompt, const std::vector<GPU>& gpus, double current_time,
     const EnvObservation* env_state) const {
     int d_bin = discretise(prompt.difficulty, 0.1, 1.0, n_diff_bins_);
+    if (env_state != nullptr) {
+        auto bins = tabular_batch_bins(*env_state, n_load_bins_, n_batch_bins_);
+        return State{d_bin, bins.first, bins.second};
+    }
     double load = system_load(gpus, current_time);
     int l_bin = discretise(load, 0.0, 1.0, n_load_bins_);
     auto pf = env_power_features(env_state);
@@ -311,30 +342,35 @@ std::optional<AllocationDecision> QLearningAllocator::allocate(
     State state = get_state(prompt, gpus, current_time, env_state);
 
     // Legacy static-engine TD bootstrap on observing s'.
-    if (prev_state_.has_value() && prev_reward_.has_value()) {
+    if (!evaluation_mode && prev_state_.has_value() && prev_reward_.has_value()) {
         const State& s = *prev_state_;
         const Action& a = *prev_action_;
         double r = *prev_reward_;
-        double old_q = q_[s][a];
-        q_[s][a] = old_q + alpha_ * (r + gamma_ * max_q(state) - old_q);
+        apply_td(s, a, r, max_q(state), gamma_, false);
     }
 
     // epsilon-greedy selection
     Action action;
     std::uniform_real_distribution<double> uni(0.0, 1.0);
-    if (uni(rng_) < epsilon_) {
+    if (!evaluation_mode && uni(rng_) < epsilon_) {
         std::uniform_int_distribution<size_t> pick(0, actions_->size() - 1);
         action = (*actions_)[pick(rng_)];
     } else {
-        auto& q_s = q_[state];
+        auto value = [&](const Action& candidate) {
+            auto found = q_.find(state);
+            if (found == q_.end()) return 0.0;
+            auto entry = found->second.find(candidate);
+            return entry == found->second.end() ? 0.0 : entry->second;
+        };
         action = (*actions_)[0];
-        double best = q_s[action];
+        double best = value(action);
         for (const Action& a : *actions_) {
-            double v = q_s[a];
+            double v = value(a);
             if (v > best) { best = v; action = a; }
         }
     }
 
+    if (!evaluation_mode) ++visits_[state][action];
     prev_state_ = state;
     prev_action_ = action;
     pending_decision_ = std::make_shared<DecisionSnapshot>();
@@ -356,40 +392,146 @@ double QLearningAllocator::effective_gamma(std::optional<double> holding_time) c
     return std::exp(-beta_d_ * std::max(0.0, *holding_time));
 }
 
+std::shared_ptr<DecisionSnapshot> QLearningAllocator::arrival_state(
+    const Prompt& prompt, const std::vector<GPU>& gpus, double time, const EnvObservation* observation) {
+    auto snapshot = std::make_shared<DecisionSnapshot>();
+    snapshot->q_state = get_state(prompt, gpus, time, observation);
+    return snapshot;
+}
+
+void QLearningAllocator::observe_arrival_transition(
+    const std::shared_ptr<DecisionSnapshot>& decision, double reward,
+    const std::shared_ptr<DecisionSnapshot>& successor, bool done, double elapsed) {
+    if (evaluation_mode || !decision) return;
+    if (!done && !successor) throw std::invalid_argument("Nonterminal Q transition requires a successor state");
+    apply_td(decision->q_state, decision->q_action, reward,
+             done ? 0.0 : max_q(successor->q_state), effective_gamma(elapsed), done);
+    epsilon_ = std::max(epsilon_min_, epsilon_ * epsilon_decay_);
+}
+
 void QLearningAllocator::observe_transition(
     const std::shared_ptr<DecisionSnapshot>& decision, double reward,
     const EnvObservation* next_state, bool done, std::optional<double> holding_time) {
-    if (!decision) return;
+    if (evaluation_mode || !decision) return;
     const State& s = decision->q_state;
     const Action& a = decision->q_action;
     epsilon_ = std::max(epsilon_min_, epsilon_ * epsilon_decay_);
 
     double gamma_k = effective_gamma(holding_time);
-    double old_q = q_[s][a];
-    double target;
-    if (done) {
-        target = reward;
-    } else {
-        auto pf = env_power_features(next_state);
-        int b_bin = discretise(pf[2], 0.0, 1.0, n_batch_bins_);
-        State s_next{std::get<0>(s), std::get<1>(s), b_bin};
-        target = reward + gamma_k * max_q(s_next);
+    double bootstrap = 0.0;
+    if (!done) {
+        auto bins = next_state ? tabular_batch_bins(*next_state, n_load_bins_, n_batch_bins_) :
+            std::make_pair(std::get<1>(s), std::get<2>(s));
+        State s_next{std::get<0>(s), bins.first, bins.second};
+        bootstrap = max_q(s_next);
     }
-    q_[s][a] = old_q + alpha_ * (target - old_q);
+    apply_td(s, a, reward, bootstrap, gamma_k, done);
 }
 
 void QLearningAllocator::update(double reward) {
+    if (evaluation_mode) return;
     prev_reward_ = reward;
     epsilon_ = std::max(epsilon_min_, epsilon_ * epsilon_decay_);
 }
 
+void QLearningAllocator::write_visits(std::ostream& output) const {
+    output << "difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,visits,updates,q_value\n";
+    if (!actions_) return;
+    for (int difficulty = 0; difficulty < n_diff_bins_; ++difficulty) {
+        for (int load = 0; load < n_load_bins_; ++load) {
+            for (int batch = 0; batch < n_batch_bins_; ++batch) {
+                State state{difficulty, load, batch};
+                for (const auto& action : *actions_) {
+                    auto lookup = [&](const auto& table) -> double {
+                        auto found = table.find(state);
+                        if (found == table.end()) return 0.0;
+                        auto entry = found->second.find(action);
+                        return entry == found->second.end() ? 0.0 : static_cast<double>(entry->second);
+                    };
+                    output << difficulty << ',' << load << ',' << batch << ','
+                           << size_name(action.first) << ',' << action.second << ','
+                           << lookup(visits_) << ',' << lookup(updates_) << ',' << lookup(q_) << '\n';
+                }
+            }
+        }
+    }
+}
+
+double QLearningAllocator::q_value(const State& state, const Action& action) const {
+    auto found = q_.find(state);
+    if (found == q_.end()) return 0.0;
+    auto entry = found->second.find(action);
+    return entry == found->second.end() ? 0.0 : entry->second;
+}
+
+void QLearningAllocator::set_td_trace(std::ostream* output) {
+    td_trace_ = output;
+    if (td_trace_) *td_trace_ << "update,difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,reward,bootstrap,discount,target,td_error,q_before,q_after,alpha,epsilon,terminal\n";
+}
+
+void QLearningAllocator::Moments::add(double value) {
+    if (count == 0) minimum = maximum = value;
+    minimum = std::min(minimum, value);
+    maximum = std::max(maximum, value);
+    ++count;
+    double delta = value - mean;
+    mean += delta / count;
+    squared_deviations += delta * (value - mean);
+}
+
+double QLearningAllocator::Moments::stddev() const {
+    return count > 1 ? std::sqrt(std::max(0.0, squared_deviations / (count - 1))) : 0.0;
+}
+
+void QLearningAllocator::write_reward_stats(std::ostream& output) const {
+    output.precision(17);
+    output << "difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,terminal,window_start,window_end,count,reward_mean,reward_stddev,reward_min,reward_max,target_mean,target_stddev,td_mean,td_stddev,abs_td_mean\n";
+    for (const auto& entry : reward_stats_) {
+        const auto& state = std::get<0>(entry.first);
+        const auto& action = std::get<1>(entry.first);
+        auto window = std::get<3>(entry.first);
+        const auto& stats = entry.second;
+        output << std::get<0>(state) << ',' << std::get<1>(state) << ',' << std::get<2>(state)
+            << ',' << size_name(action.first) << ',' << action.second << ',' << std::get<2>(entry.first)
+            << ',' << window * 5000 + 1 << ',' << std::min((window + 1) * 5000, td_update_count_)
+            << ',' << stats.reward.count << ',' << stats.reward.mean << ',' << stats.reward.stddev()
+            << ',' << stats.reward.minimum << ',' << stats.reward.maximum << ',' << stats.target.mean
+            << ',' << stats.target.stddev() << ',' << stats.td_error.mean << ',' << stats.td_error.stddev()
+            << ',' << stats.absolute_td_error.mean << '\n';
+    }
+}
+
+void QLearningAllocator::apply_td(const State& state, const Action& action,
+    double reward, double bootstrap, double discount, bool terminal) {
+    double& value = q_[state][action];
+    double before = value;
+    double target = reward + (terminal ? 0.0 : discount * bootstrap);
+    double error = target - before;
+    auto& stats = reward_stats_[std::make_tuple(state, action, terminal, td_update_count_ / 5000)];
+    stats.reward.add(reward);
+    stats.target.add(target);
+    stats.td_error.add(error);
+    stats.absolute_td_error.add(std::abs(error));
+    value += alpha_ * error;
+    ++updates_[state][action];
+    ++td_update_count_;
+    if (td_trace_) {
+        td_trace_->precision(17);
+        *td_trace_ << td_update_count_ << ',' << std::get<0>(state) << ','
+            << std::get<1>(state) << ',' << std::get<2>(state) << ','
+            << size_name(action.first) << ',' << action.second << ',' << reward << ','
+            << bootstrap << ',' << discount << ',' << target << ',' << error << ','
+            << before << ',' << value << ',' << alpha_ << ',' << epsilon_ << ',' << terminal << '\n';
+    }
+}
+
 void QLearningAllocator::end_episode() {
+    if (evaluation_mode) return;
     if (prev_state_.has_value() && prev_reward_.has_value()) {
         const State& s = *prev_state_;
         const Action& a = *prev_action_;
         double r = *prev_reward_;
-        double old_q = q_[s][a];
-        q_[s][a] = old_q + alpha_ * (r - old_q);
+        apply_td(s, a, r, 0.0, gamma_, true);
     }
     prev_state_.reset();
     prev_action_.reset();
@@ -481,7 +623,7 @@ std::optional<AllocationDecision> DQNAllocator::allocate(
     torch::Tensor state_vec = state_vector(prompt, gpus, current_time, env_state);
 
     // legacy static-engine transition store
-    if (prev_state_vec_.has_value() && prev_reward_.has_value()) {
+    if (!evaluation_mode && prev_state_vec_.has_value() && prev_reward_.has_value()) {
         store_transition(*prev_state_vec_, *prev_action_idx_, *prev_reward_,
                          state_vec, false, gamma_);
         train_step();
@@ -489,7 +631,7 @@ std::optional<AllocationDecision> DQNAllocator::allocate(
 
     int action_idx;
     std::uniform_real_distribution<double> uni(0.0, 1.0);
-    if (uni(rng_) < epsilon_) {
+    if (!evaluation_mode && uni(rng_) < epsilon_) {
         std::uniform_int_distribution<int> pick(0, static_cast<int>(actions_->size()) - 1);
         action_idx = pick(rng_);
     } else {
@@ -519,6 +661,25 @@ double DQNAllocator::effective_gamma(std::optional<double> holding_time) const {
     return std::exp(-beta_d_ * std::max(0.0, *holding_time));
 }
 
+std::shared_ptr<DecisionSnapshot> DQNAllocator::arrival_state(
+    const Prompt& prompt, const std::vector<GPU>& gpus, double time, const EnvObservation* observation) {
+    auto snapshot = std::make_shared<DecisionSnapshot>();
+    snapshot->dqn_state = state_vector(prompt, gpus, time, observation);
+    snapshot->is_dqn = true;
+    return snapshot;
+}
+
+void DQNAllocator::observe_arrival_transition(
+    const std::shared_ptr<DecisionSnapshot>& decision, double reward,
+    const std::shared_ptr<DecisionSnapshot>& successor, bool done, double elapsed) {
+    if (evaluation_mode || !decision) return;
+    auto next = done ? torch::zeros({state_dim_}, torch::kFloat32) : successor->dqn_state;
+    store_transition(decision->dqn_state, decision->dqn_action_idx, reward, next,
+                     done, effective_gamma(elapsed));
+    train_step();
+    epsilon_ = std::max(epsilon_min_, epsilon_ * epsilon_decay_);
+}
+
 torch::Tensor DQNAllocator::next_vec_from_obs(const torch::Tensor& prev_vec,
                                               const EnvObservation* next_state) const {
     torch::Tensor next_vec = prev_vec.clone();
@@ -535,7 +696,7 @@ torch::Tensor DQNAllocator::next_vec_from_obs(const torch::Tensor& prev_vec,
 void DQNAllocator::observe_transition(
     const std::shared_ptr<DecisionSnapshot>& decision, double reward,
     const EnvObservation* next_state, bool done, std::optional<double> holding_time) {
-    if (!decision) return;
+    if (evaluation_mode || !decision) return;
     torch::Tensor state_vec = decision->dqn_state;
     int action_idx = decision->dqn_action_idx;
     epsilon_ = std::max(epsilon_min_, epsilon_ * epsilon_decay_);
@@ -552,11 +713,13 @@ void DQNAllocator::observe_transition(
 }
 
 void DQNAllocator::update(double reward) {
+    if (evaluation_mode) return;
     prev_reward_ = reward;
     epsilon_ = std::max(epsilon_min_, epsilon_ * epsilon_decay_);
 }
 
 void DQNAllocator::end_episode() {
+    if (evaluation_mode) return;
     if (prev_state_vec_.has_value() && prev_reward_.has_value()) {
         torch::Tensor dummy_next = torch::zeros({state_dim_}, torch::kFloat32);
         store_transition(*prev_state_vec_, *prev_action_idx_, *prev_reward_,

@@ -3,6 +3,7 @@
 // episodes before the final comparison run.
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -61,6 +62,14 @@ struct Args {
     std::string objective = "energy";
     std::string engine = "static";
     int episodes = 0;
+    bool debug = false;
+    double q_epsilon = 0.2;
+    double q_alpha = 0.1;
+    double q_epsilon_decay = 0.998;
+    double q_epsilon_min = 0.01;
+    std::string q_visits;
+    std::string q_td_trace;
+    std::string q_reward_stats;
     int small_gpus = 2;
     int medium_gpus = 2;
     int large_gpus = 1;
@@ -80,6 +89,14 @@ void usage() {
         "  --medium-gpus N       (default 2)\n"
         "  --large-gpus N        (default 1)\n"
         "  --json PATH           write metrics to a JSON file\n");
+    std::printf("  --debug               reward breakdown and placement diagnostics per evaluation\n");
+    std::printf("  --q-epsilon X         Q-learning initial exploration (default 0.2)\n"
+                "  --q-epsilon-decay X   per-update exploration multiplier (default 0.998)\n"
+                "  --q-epsilon-min X     exploration floor (default 0.01)\n"
+                "  --q-visits PATH       export Q-learning training visits and update counts as CSV\n"
+                "  --q-td-trace PATH     stream every Q-learning TD update to CSV\n"
+                "  --q-alpha X          Q-learning step size in (0,1] (default 0.1)\n"
+                "  --q-reward-stats PATH export reward/TD dispersion by state/action/window\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +199,7 @@ void print_banner(const Args& a) {
                 a.n_prompts);
     std::printf("                     score each by reward = -(latency,energy,quality loss)\n");
     std::printf("  Heuristics       : random, always_small, always_large, difficulty,\n");
-    std::printf("                     least_loaded, energy_aware\n");
+    std::printf("                     least_loaded, energy_aware, consolidate_small\n");
     std::printf("  Learners         : epsilon_greedy (bandit), q_learning (tabular TD),\n");
     std::printf("                     dqn (LibTorch MLP, Double-DQN + replay)\n");
     if (a.episodes > 0)
@@ -214,6 +231,25 @@ bool parse_args(int argc, char** argv, Args& a) {
             return argv[++i];
         };
         if (s == "-h" || s == "--help") { usage(); return false; }
+        else if (s == "--debug") { a.debug = true; }
+        else if (s == "--q-visits") { auto value = next("--q-visits"); if (!value) return false; a.q_visits = value; }
+        else if (s == "--q-td-trace") { auto value = next("--q-td-trace"); if (!value) return false; a.q_td_trace = value; }
+        else if (s == "--q-reward-stats") { auto value = next("--q-reward-stats"); if (!value) return false; a.q_reward_stats = value; }
+        else if (s == "--q-epsilon" || s == "--q-epsilon-decay" || s == "--q-epsilon-min" || s == "--q-alpha") {
+            auto value = next(s.c_str());
+            if (!value) return false;
+            char* end = nullptr;
+            double parsed = std::strtod(value, &end);
+            if (end == value || *end != '\0' || !std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0 ||
+                ((s == "--q-epsilon-decay" || s == "--q-alpha") && parsed == 0.0)) {
+                std::fprintf(stderr, "invalid probability/multiplier for %s: %s\n", s.c_str(), value);
+                return false;
+            }
+            if (s == "--q-alpha") a.q_alpha = parsed;
+            else if (s == "--q-epsilon") a.q_epsilon = parsed;
+            else if (s == "--q-epsilon-decay") a.q_epsilon_decay = parsed;
+            else a.q_epsilon_min = parsed;
+        }
         else if (s == "-n" || s == "--n-prompts") { auto v = next("--n-prompts"); if (!v) return false; a.n_prompts = std::atoi(v); }
         else if (s == "--seed") { auto v = next("--seed"); if (!v) return false; a.seed = std::strtoull(v, nullptr, 10); }
         else if (s == "--objective") { auto v = next("--objective"); if (!v) return false; a.objective = v; }
@@ -225,17 +261,82 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (s == "--json") { auto v = next("--json"); if (!v) return false; a.json_out = v; }
         else { std::printf("unknown arg: %s\n", s.c_str()); usage(); return false; }
     }
+    if (a.q_epsilon_min > a.q_epsilon) {
+        std::fprintf(stderr, "--q-epsilon-min must not exceed --q-epsilon\n");
+        return false;
+    }
     return true;
 }
 
 // Run a fresh episode (fresh GPU pool) for one allocator on the given prompts.
+void print_debug(const Allocator& allocator, const RewardWeights& weights,
+                 const std::vector<JobResult>& results, double residual_energy) {
+    double latency_cost = 0.0, energy_cost = 0.0, quality_cost = 0.0;
+    double floor_cost = 0.0, reward_sum = 0.0, attributed_energy = 0.0;
+    int violations = 0;
+    std::map<int, int> gpu_jobs;
+    std::map<std::string, int> model_jobs;
+    for (const auto& result : results) {
+        latency_cost += weights.latency * result.latency;
+        energy_cost += weights.energy * result.energy;
+        quality_cost += weights.quality_loss * result.quality_loss;
+        if (result.quality < weights.min_quality) {
+            ++violations;
+            floor_cost += weights.min_quality_penalty * (weights.min_quality - result.quality);
+        }
+        reward_sum += result.reward;
+        attributed_energy += result.energy;
+        ++gpu_jobs[result.gpu.id];
+        ++model_jobs[result.llm.name];
+    }
+    const double count = static_cast<double>(std::max<size_t>(1, results.size()));
+    std::printf("\n[DEBUG %s] completed=%zu effective_epsilon=%.6f configured_epsilon=%.6f weights=(latency=%.6g energy=%.6g quality=%.6g floor=%.6g penalty=%.6g)\n",
+                allocator.name().c_str(), results.size(), allocator.evaluation_mode ? 0.0 : allocator.epsilon(), allocator.epsilon(),
+                weights.latency, weights.energy, weights.quality_loss,
+                weights.min_quality, weights.min_quality_penalty);
+    std::printf("[DEBUG] mean cost: latency=%.6f energy=%.6f quality=%.6f floor=%.6f; mean reward=%.6f reconstruction_error=%.9g\n",
+                latency_cost / count, energy_cost / count, quality_cost / count,
+                floor_cost / count, reward_sum / count,
+                (reward_sum + latency_cost + energy_cost + quality_cost + floor_cost) / count);
+    std::printf("[DEBUG] attributed_energy=%.3fJ residual_system_energy=%.3fJ floor_violations=%d/%zu\n",
+                attributed_energy, residual_energy, violations, results.size());
+    std::printf("[DEBUG] placements by GPU:");
+    for (const auto& entry : gpu_jobs) std::printf(" gpu%d=%d", entry.first, entry.second);
+    std::printf("\n[DEBUG] placements by model:");
+    for (const auto& entry : model_jobs) std::printf(" %s=%d", entry.first.c_str(), entry.second);
+    std::printf("\n");
+    if (allocator.is_learner() && !allocator.evaluation_mode && allocator.epsilon() > 0.0)
+        std::printf("[DEBUG WARNING] evaluation retains nonzero exploration; repeated runs can choose different placements.\n");
+}
+
 AggregatedMetrics run_episode(const Args& a, const RewardWeights& weights,
                               const std::vector<LLM>& llm_pool, Allocator& alloc,
-                              const std::vector<Prompt>& prompts) {
+                              const std::vector<Prompt>& prompts,
+                              std::vector<JobResult>* saved_results = nullptr) {
+    alloc.reset_for_episode();
+    alloc.evaluation_mode = true;
     std::vector<GPU> gpus = create_gpu_pool(a.small_gpus, a.medium_gpus, a.large_gpus);
     if (a.engine == "batched") {
         BatchedSimulator sim(gpus, llm_pool, BatchedConfig{weights});
         auto results = sim.run(alloc, prompts, false);
+        if (saved_results) *saved_results = results;
+        if (a.debug) std::printf("\n[DEBUG physics] active=%.6f idle=%.6f sleep=%.6f wake=%.6f accounting_error=%.9gJ; evaluation frozen\n",
+                                sim.active_energy, sim.idle_energy, sim.sleep_energy,
+                                sim.wake_energy, sim.accounting_error);
+        if (a.debug) {
+            double transition_energy = 0.0, transition_reward = 0.0, reported_reward = 0.0;
+            for (const auto& transition : sim.arrival_transitions) {
+                transition_energy += transition.energy;
+                transition_reward += transition.reward;
+            }
+            for (const auto& result : results) reported_reward += result.reward;
+            std::printf("[DEBUG arrival transitions] count=%zu energy=%.6fJ reward=%.6f reporting_reward_error=%.9g terminal=%s\n",
+                        sim.arrival_transitions.size(), transition_energy, transition_reward,
+                        transition_reward - reported_reward,
+                        !sim.arrival_transitions.empty() && sim.arrival_transitions.back().terminal ? "yes" : "no");
+        }
+        if (a.debug) print_debug(alloc, weights, results, sim.total_idle_energy);
+        alloc.evaluation_mode = false;
         return aggregate(alloc.name(), results, sim.total_idle_energy, sim.dropped);
     }
     SimulatorConfig scfg;
@@ -243,6 +344,9 @@ AggregatedMetrics run_episode(const Args& a, const RewardWeights& weights,
     scfg.reward_weights = weights;
     Simulator sim(gpus, llm_pool, scfg);
     auto results = sim.run(alloc, prompts, false);
+    if (saved_results) *saved_results = results;
+    if (a.debug) print_debug(alloc, weights, results, sim.total_idle_energy);
+    alloc.evaluation_mode = false;
     return aggregate(alloc.name(), results, sim.total_idle_energy, sim.dropped);
 }
 
@@ -276,6 +380,10 @@ void write_json(const std::string& path, const Args& a,
     std::ofstream f(path);
     f << "{\n  \"objective\": \"" << a.objective << "\",\n";
     f << "  \"engine\": \"" << a.engine << "\",\n";
+    f << "  \"q_alpha\": " << a.q_alpha << ",\n";
+    f << "  \"q_exploration\": {\"initial\": " << a.q_epsilon
+      << ", \"decay_per_update\": " << a.q_epsilon_decay
+      << ", \"minimum\": " << a.q_epsilon_min << "},\n";
     f << "  \"episodes\": " << a.episodes << ",\n";
     f << "  \"metrics\": [\n";
     for (size_t i = 0; i < metrics.size(); ++i) {
@@ -375,8 +483,8 @@ void print_run_summary(const Args& a,
 // across profiles (different weightings), so we only pick the best WITHIN each.
 void print_profile_winners(const Args& a, const std::vector<LLM>& llm_pool,
                            const std::vector<Prompt>& prompts,
-                           std::vector<std::unique_ptr<Allocator>>& heuristics,
-                           std::vector<std::unique_ptr<Allocator>>& learners) {
+                           const std::map<std::string, std::vector<JobResult>>& cached_results,
+                           const std::vector<AggregatedMetrics>& cached_metrics) {
     const char* profiles[] = {"energy", "balanced", "quality", "latency"};
     const std::string bar(78, '=');
     std::printf("\n%s\n", bar.c_str());
@@ -388,6 +496,7 @@ void print_profile_winners(const Args& a, const std::vector<LLM>& llm_pool,
     std::printf("%s\n", std::string(78, '-').c_str());
 
     for (const char* prof : profiles) {
+        if (a.debug) std::printf("\n[DEBUG] profile=%s: rescoring cached, frozen evaluation results.\n", prof);
         RewardWeights w;
         try {
             w = RewardWeights::profile(prof);
@@ -397,15 +506,20 @@ void print_profile_winners(const Args& a, const std::vector<LLM>& llm_pool,
 
         const AggregatedMetrics* best = nullptr;
         AggregatedMetrics best_copy;
-        auto consider = [&](Allocator& alloc) {
-            AggregatedMetrics m = run_episode(a, w, llm_pool, alloc, prompts);
+        auto consider = [&](const AggregatedMetrics& original) {
+            auto results = cached_results.at(original.allocator_name);
+            for (auto& result : results) {
+                double penalty = w.min_quality_penalty * std::max(0.0, w.min_quality - result.quality);
+                result.reward = -(w.latency * result.latency + w.energy * result.energy +
+                                  w.quality_loss * result.quality_loss + penalty);
+            }
+            AggregatedMetrics m = aggregate(original.allocator_name, results, original.idle_energy, original.dropped);
             if (!best || m.mean_reward > best_copy.mean_reward) {
                 best_copy = m;
                 best = &best_copy;
             }
         };
-        for (auto& h : heuristics) consider(*h);
-        for (auto& l : learners) consider(*l);
+        for (const auto& original : cached_metrics) consider(original);
 
         if (best) {
             std::printf("  %-10s | %-14s | %10.3f | %9.0fJ | %8.3f\n",
@@ -445,11 +559,18 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<Allocator>> learners;
     learners.push_back(std::make_unique<EpsilonGreedyAllocator>(0.15, 0.999, 5, a.seed));
     learners.push_back(std::make_unique<QLearningAllocator>(
-        0.1, 0.95, 0.2, 0.998, 0.01, 5, 4, 3, 0.0, a.seed));
+        a.q_alpha, 0.95, a.q_epsilon, a.q_epsilon_decay, a.q_epsilon_min, 5, 4, 3, 0.0, a.seed));
     learners.push_back(std::make_unique<DQNAllocator>(
         0.3, 0.995, 0.01, 0.95, 1e-3, 64, 5000, 50, 64, 0.0, a.seed));
 
     // --- Train learners if requested ---
+    std::ofstream td_trace;
+    if (!a.q_td_trace.empty()) {
+        td_trace.open(a.q_td_trace);
+        if (!td_trace) { std::fprintf(stderr, "cannot write %s\n", a.q_td_trace.c_str()); return 1; }
+        for (auto& learner : learners)
+            if (auto* tabular = dynamic_cast<QLearningAllocator*>(learner.get())) tabular->set_td_trace(&td_trace);
+    }
     if (a.episodes > 0) {
         std::printf("\n============================================================\n");
         std::printf("  Training learning allocators (%d episodes, %s objective)\n",
@@ -464,6 +585,34 @@ int main(int argc, char** argv) {
     }
 
     // --- Final evaluation on a common prompt stream ---
+    if (!a.q_td_trace.empty()) {
+        for (auto& learner : learners)
+            if (auto* tabular = dynamic_cast<QLearningAllocator*>(learner.get())) tabular->set_td_trace(nullptr);
+        td_trace.close();
+        if (!td_trace) { std::fprintf(stderr, "failed to write %s\n", a.q_td_trace.c_str()); return 1; }
+        std::printf("[INFO] Q-learning TD updates written to %s\n", a.q_td_trace.c_str());
+    }
+    std::printf("[Q-learning] alpha=%.6f\n", a.q_alpha);
+    if (!a.q_reward_stats.empty()) {
+        std::ofstream output(a.q_reward_stats);
+        if (!output) { std::fprintf(stderr, "cannot write %s\n", a.q_reward_stats.c_str()); return 1; }
+        for (const auto& learner : learners)
+            if (const auto* tabular = dynamic_cast<const QLearningAllocator*>(learner.get())) tabular->write_reward_stats(output);
+        output.close();
+        if (!output) { std::fprintf(stderr, "failed to write %s\n", a.q_reward_stats.c_str()); return 1; }
+        std::printf("[INFO] Q-learning reward dispersion written to %s\n", a.q_reward_stats.c_str());
+    }
+    std::printf("\n[Q-learning exploration] initial=%.6f decay/update=%.8f floor=%.6f\n",
+                a.q_epsilon, a.q_epsilon_decay, a.q_epsilon_min);
+    if (!a.q_visits.empty()) {
+        std::ofstream output(a.q_visits);
+        if (!output) { std::fprintf(stderr, "cannot write %s\n", a.q_visits.c_str()); return 1; }
+        for (const auto& learner : learners)
+            if (const auto* tabular = dynamic_cast<const QLearningAllocator*>(learner.get())) tabular->write_visits(output);
+        output.close();
+        if (!output) { std::fprintf(stderr, "failed to write %s\n", a.q_visits.c_str()); return 1; }
+        std::printf("[INFO] Q-learning training coverage written to %s\n", a.q_visits.c_str());
+    }
     std::printf("\n%s\n", std::string(78, '=').c_str());
     std::printf("  EVALUATION — all allocators on one shared stream of %d prompts\n",
                 a.n_prompts);
@@ -473,6 +622,7 @@ int main(int argc, char** argv) {
     std::vector<Prompt> prompts = gen.generate(a.n_prompts);
 
     std::vector<AggregatedMetrics> all_metrics;
+    std::map<std::string, std::vector<JobResult>> cached_results;
 
     auto heuristics = all_heuristic_allocators(a.seed);
     const size_t total_allocs = heuristics.size() + learners.size();
@@ -482,7 +632,7 @@ int main(int argc, char** argv) {
         std::printf("  [%2zu/%2zu] %-13s %-14s ... ",
                     ++done, total_allocs, kind, alloc.name().c_str());
         std::fflush(stdout);
-        AggregatedMetrics m = run_episode(a, weights, llm_pool, alloc, prompts);
+        AggregatedMetrics m = run_episode(a, weights, llm_pool, alloc, prompts, &cached_results[alloc.name()]);
         std::printf("reward %8.3f | sys_energy %8.0fJ | quality %.3f | drop %d\n",
                     m.mean_reward, m.system_energy, m.mean_quality, m.dropped);
         std::fflush(stdout);
@@ -503,6 +653,6 @@ int main(int argc, char** argv) {
     print_run_summary(a, all_metrics);
 
     // --- Cross-profile winners: which policy wins energy/balanced/quality/latency ---
-    print_profile_winners(a, llm_pool, prompts, heuristics, learners);
+    print_profile_winners(a, llm_pool, prompts, cached_results, all_metrics);
     return 0;
 }

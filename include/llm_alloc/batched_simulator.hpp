@@ -23,6 +23,14 @@ struct BatchedConfig {
     double sleep_timeout = 5.0;
 };
 
+struct ArrivalTransitionMetrics {
+    double energy = 0.0;
+    double service_cost = 0.0;
+    double reward = 0.0;
+    double elapsed = 0.0;
+    bool terminal = false;
+};
+
 class BatchedSimulator {
 public:
     BatchedSimulator(std::vector<GPU> gpus, std::vector<LLM> llm_pool,
@@ -33,6 +41,12 @@ public:
                                bool online_update = false);
 
     double total_idle_energy = 0.0;
+    double active_energy = 0.0;
+    double idle_energy = 0.0;
+    double sleep_energy = 0.0;
+    double wake_energy = 0.0;
+    double accounting_error = 0.0;
+    std::vector<ArrivalTransitionMetrics> arrival_transitions;
     int dropped = 0;
 
     std::vector<GPU>& gpus() { return gpus_; }

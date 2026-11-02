@@ -51,6 +51,14 @@ private:
     std::mt19937_64 rng_;
 };
 
+class ConsolidateSmallAllocator : public Allocator {
+public:
+    std::optional<AllocationDecision> allocate(
+        const Prompt&, std::vector<GPU>&, const std::vector<LLM>&, double,
+        const EnvObservation*) override;
+    std::string name() const override { return "consolidate_small"; }
+};
+
 // --- DifficultyAllocator ---
 class DifficultyAllocator : public Allocator {
 public:

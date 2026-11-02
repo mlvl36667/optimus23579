@@ -5,12 +5,14 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "llm_alloc/batched_simulator.hpp"
+#include "llm_alloc/allocators.hpp"
 #include "llm_alloc/domain.hpp"
 #include "llm_alloc/learning.hpp"
 #include "llm_alloc/metrics.hpp"
@@ -49,9 +51,13 @@ AggregatedMetrics train_and_eval(const std::string& learner_name,
     std::vector<LLM> pool = default_llm_pool();
     RewardWeights weights = RewardWeights::profile(objective);
     auto alloc = make_learner(learner_name, seed);
-    if (!alloc) return AggregatedMetrics{};
+    if (!alloc) {
+        if (learner_name == "always_small") alloc = std::make_unique<AlwaysSmallAllocator>(seed);
+        else if (learner_name == "consolidate_small") alloc = std::make_unique<ConsolidateSmallAllocator>();
+        else throw std::invalid_argument("Unknown sweep policy: " + learner_name);
+    }
 
-    for (int ep = 0; ep < episodes; ++ep) {
+    for (int ep = 0; alloc->is_learner() && ep < episodes; ++ep) {
         std::vector<GPU> g = create_gpu_pool(gpus_cfg.s, gpus_cfg.m, gpus_cfg.l);
         BatchedConfig bc{weights};
         bc.sleep_timeout = sleep_timeout;
@@ -66,24 +72,31 @@ AggregatedMetrics train_and_eval(const std::string& learner_name,
     BatchedConfig bc{weights};
     bc.sleep_timeout = sleep_timeout;
     BatchedSimulator sim(g, pool, bc);
-    // force greedy: QLearning/DQN expose set via epsilon() but we need a setter;
-    // QLearningAllocator has set_epsilon; for others epsilon decays near min anyway.
-    if (auto* ql = dynamic_cast<QLearningAllocator*>(alloc.get())) ql->set_epsilon(0.0);
+    alloc->reset_for_episode();
+    alloc->evaluation_mode = true;
     auto results = sim.run(*alloc, gen_prompts(n_prompts, interarrival, difficulty, seed + 999), false);
     return aggregate(learner_name, results, sim.total_idle_energy, sim.dropped);
 }
 
 json sweep_arrival(const std::string& metric) {
-    std::vector<double> interarrivals = {2.0, 1.0, 0.5, 0.3, 0.2, 0.12, 0.08};
+    std::vector<double> interarrivals = {2.0, 1.0, 0.5, 0.3, 0.2, 0.12, 0.08, 0.04, 0.02};
     std::vector<double> rates;
     for (double ia : interarrivals) rates.push_back(1.0 / ia);
-    std::vector<std::string> learners = {"q_learning", "dqn", "epsilon_greedy"};
+    std::vector<std::string> learners = {"always_small", "consolidate_small", "q_learning", "dqn", "epsilon_greedy"};
     json series;
+    json measurements = json::array();
     for (const auto& ln : learners) {
         std::vector<double> ys;
         for (double ia : interarrivals) {
             auto m = train_and_eval(ln, "energy", {2, 2, 1}, N_PROMPTS, ia, 0.5, 5.0, EPISODES);
             ys.push_back(metric == "energy" ? m.system_energy / 1000.0 : m.mean_latency);
+            measurements.push_back({{"policy", ln}, {"arrival_rate", 1.0 / ia},
+                {"system_energy_j", m.system_energy}, {"mean_latency_s", m.mean_latency},
+                {"p95_latency_s", m.p95_latency}, {"mean_quality", m.mean_quality},
+                {"mean_reward", m.mean_reward}, {"dropped", m.dropped}});
+            std::printf("  %s rate=%.3f energy=%.3fJ latency=%.3fs quality=%.3f reward=%.3f\n",
+                        ln.c_str(), 1.0 / ia, m.system_energy, m.mean_latency, m.mean_quality, m.mean_reward);
+            std::fflush(stdout);
         }
         series[ln] = ys;
     }
@@ -93,6 +106,10 @@ json sweep_arrival(const std::string& metric) {
     j["ylabel"] = metric == "energy" ? "System energy (kJ)" : "Mean latency (s)";
     j["x"] = rates;
     j["series"] = series;
+    j["measurements"] = measurements;
+    j["seed"] = 42;
+    j["episodes"] = EPISODES;
+    j["n_prompts"] = N_PROMPTS;
     return j;
 }
 

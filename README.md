@@ -178,6 +178,12 @@ python3 tools/measure_ollama.py \
 
 ## Build
 
+On Debian/Ubuntu, install the JSON development dependency:
+
+```bash
+sudo apt install nlohmann-json3-dev
+```
+
 If LibTorch is not already installed, install CPU PyTorch in a virtual
 environment from the repository root:
 
@@ -201,6 +207,166 @@ cmake --build . -j4
 ```
 
 ## Run
+
+### Q-learning exploration and coverage experiment
+
+`--q-alpha X` sets the tabular learning rate (default 0.1; valid range `(0,1]`).
+`--q-reward-stats PATH` exports reward, target and TD-error statistics grouped by
+state/action, terminal flag and nonoverlapping 5,000-update windows. It includes
+counts, sample standard deviations, reward extrema and mean absolute TD error.
+One-sample groups report standard deviation zero; this does not establish low
+variance. Counts and windows must be considered when comparing groups. High
+within-group dispersion can reflect random arrivals, hidden state, or changing
+policies; it alone does not prove state aliasing. Raw TD traces retain every update
+for narrower-window or conditional analyses.
+
+To isolate training duration from learning rate, compare three settings with the
+same exploration schedule: baseline (150 episodes, alpha 0.1), longer (600, 0.1),
+and smaller steps (150, 0.02). Do not change both at once. Start with seed 42;
+repeat the loop for seeds 43 through 46 before drawing conclusions:
+
+```bash
+cmake --build build -j2 && ctest --test-dir build --output-on-failure
+mkdir -p experiments/q_stability
+set -o pipefail
+for setting in baseline longer smaller_alpha; do
+  episodes=150
+  alpha=0.1
+  if [ "$setting" = longer ]; then episodes=600; fi
+  if [ "$setting" = smaller_alpha ]; then alpha=0.02; fi
+  prefix="experiments/q_stability/${setting}_42"
+  OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./build/llm_run \
+    --engine batched --objective energy --episodes "$episodes" \
+    --n-prompts 200 --seed 42 --q-alpha "$alpha" \
+    --q-epsilon 0.2 --q-epsilon-decay 0.998 --q-epsilon-min 0.01 \
+    --q-reward-stats "${prefix}_rewards.csv" --q-td-trace "${prefix}_td.csv" \
+    --q-visits "${prefix}_visits.csv" --json "${prefix}.json" --debug \
+    | tee "${prefix}.log" || exit 1
+done
+```
+
+The runner still trains all three learners; longer runs therefore also increase
+DQN runtime. Only the Q-learning alpha changes in the smaller-step experiment.
+
+`--q-td-trace PATH` streams every tabular TD update to CSV without retaining
+the trace in memory. Rows contain a global update index, state/action, reward,
+successor maximum Q (`bootstrap`), discount, target, TD error, Q before/after,
+learning rate, exploration and terminal flag. The epsilon column is its value
+at the update, not necessarily the exploration used to choose the earlier action.
+Terminal targets ignore the bootstrap. Evaluation produces no TD rows. When
+inspecting convergence, compare TD-error distributions over successive update
+windows rather than expecting individual stochastic errors to decrease monotonically.
+
+All tabular update paths share the same TD calculation. Regression tests check
+a hand-calculated bootstrap target, a terminal target with no bootstrap, frozen
+evaluation, and learning the cheapest GPU in a deterministic one-step environment
+with known tier costs 1, 5 and 9. Passing these tests validates basic arithmetic
+and action selection, not convergence in the full partially observed simulator.
+
+Build and run tests locally, then collect a diagnostic trace:
+
+```bash
+cmake --build build -j2 && ctest --test-dir build --output-on-failure
+mkdir -p experiments/q_td
+set -o pipefail
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./build/llm_run \
+  --engine batched --objective energy --episodes 150 --n-prompts 200 \
+  --seed 42 --q-epsilon 0.2 --q-epsilon-decay 0.998 --q-epsilon-min 0.01 \
+  --q-td-trace experiments/q_td/seed_42_td.csv \
+  --q-visits experiments/q_td/seed_42_visits.csv \
+  --json experiments/q_td/seed_42.json --debug | tee experiments/q_td/seed_42.log
+```
+
+`llm_run --q-visits PATH` exports all tabular state/action combinations, including
+unvisited ones, with training selection counts (`visits`), TD update counts
+(`updates`) and learned values. Frozen evaluation does not increment these counts.
+The 60 states and 18 actions produce 1,080 CSV data rows after initialization.
+Coverage of all theoretical states is not expected on every workload; inspect
+coverage within reached states as well as the overall fraction.
+
+Use `--q-epsilon`, `--q-epsilon-decay` and `--q-epsilon-min` to control only the
+tabular learner. Decay is applied per update, not per episode. For 150 episodes
+of 200 arrivals, decay 0.99995 takes initial epsilon 0.2 to about 0.045, versus
+the original decay 0.998 which reaches the 0.01 floor after about 1,497 updates.
+Keep initial epsilon and the floor fixed to isolate the effect of slower decay.
+
+Build, test, then compare paired seeds at the same workload:
+
+```bash
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+mkdir -p experiments/q_exploration
+set -o pipefail
+for seed in 42 43 44 45 46; do
+  for schedule in baseline slow; do
+    decay=0.998
+    if [ "$schedule" = slow ]; then decay=0.99995; fi
+    prefix="experiments/q_exploration/${schedule}_${seed}"
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./build/llm_run \
+      --engine batched --objective energy --episodes 150 --n-prompts 200 \
+      --seed "$seed" --q-epsilon 0.2 --q-epsilon-min 0.01 \
+      --q-epsilon-decay "$decay" --q-visits "${prefix}_visits.csv" \
+      --json "${prefix}.json" --debug | tee "${prefix}.log" || exit 1
+  done
+done
+```
+
+All allocators are evaluated, but only Q-learning's exploration settings change.
+Compare Q-learning reward, energy, quality and latency against `consolidate_small`
+within each seed, then compare baseline versus slow across the five paired seeds.
+The exploration-only experiment originally used the old state representation.
+After the batched-state fix, rerun into a new output directory: these results
+are not directly the same experiment as the archived exploration-only runs.
+
+For batched Q-learning, `load_bin` now uses the fraction of GPUs with active or
+waiting sequences, with upward rounding so even one occupied GPU is visible.
+Any waiting sequence selects the highest load bin. `batch_bin` uses the maximum
+per-GPU active/capacity ratio rather than a fleet-wide average. With the default
+three batch bins: 0 means empty, 1 means nonempty up to half full, and 2 means
+more than half full. These signals come from the live observation, not stale
+`busy_until` values. Static-engine state construction is unchanged. The table
+still has 60 states; it does not yet encode model residency or sleep state.
+
+`consolidate_small` is a fixed control: it always uses the smallest model on
+the lowest-ID GPU of the smallest compatible tier, regardless of load or sleep
+state. It queues work instead of spreading it. If the fleet has no small GPU,
+it uses the smallest compatible tier available.
+
+The arrival sweeps compare this control and `always_small` against all three
+learners at nine rates from 0.5 to 50 requests/s, retraining at each rate.
+Evaluation is frozen and uses a shared held-out stream per rate. The JSON includes
+energy, mean/p95 latency, quality, reward and dropped jobs in `measurements`:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./build/llm_sweep --sweep arrival_energy --outdir sweeps
+```
+
+This sweep uses seed 42 only; it is not evidence of statistical significance.
+
+Add `--debug` to `llm_run` to print evaluation reward components, quality-floor
+violations, GPU/model placement counts, retained exploration, and energy attributed
+to jobs versus residual system energy. Evaluation disables learner exploration
+and static-engine bootstrap updates. Profile comparisons rescore the same cached
+results without rerunning policies. Batched debug output also reports integrated
+active, idle (including waking power), sleep and one-off wake energy and their
+accounting error.
+
+The batched engine trains on consecutive arrival decisions (rounded to simulator
+ticks), not sequence completions. The successor observation includes the next
+prompt and the current fleet. Each transition charges all fleet energy since the
+previous decision, plus latency and quality costs of jobs completing in that
+interval. The final transition includes draining the fleet and has no bootstrap.
+Same-tick arrivals have zero elapsed time. Energy before the first arrival is
+charged to the first transition; this initial idle cost is policy-independent.
+Time-based discounting uses decision-to-decision elapsed time, or the drain time
+for the terminal transition. Constant discounting remains the default.
+
+For reporting and cached profile scoring, residual fleet energy (including wake
+costs and gaps with no active jobs) is distributed equally over completed jobs.
+This reporting allocation is not used for temporal credit assignment. Undiscounted
+transition rewards and reported job rewards therefore sum to the same full-system
+objective when all prompts complete. The static engine retains its legacy reward.
+The compact fleet observation is still an approximation, not a full Markov state.
 
 ```bash
 ./llm_run                                  # comparison (static engine)

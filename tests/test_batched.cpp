@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <sstream>
 
 #include "llm_alloc/allocators.hpp"
 #include "llm_alloc/batched_simulator.hpp"
@@ -12,6 +13,311 @@
 #include "llm_alloc/simulator.hpp"
 
 using namespace llm_alloc;
+
+TEST(q_reward_stats_separate_terminal_updates_and_use_sample_variance) {
+    QLearningAllocator learner(0.25, 0.5);
+    auto decision = std::make_shared<DecisionSnapshot>();
+    decision->q_state = {0, 0, 0};
+    decision->q_action = {Size::SMALL, "gpu_small"};
+    learner.observe_arrival_transition(decision, -2.0, nullptr, true, 1.0);
+    learner.observe_arrival_transition(decision, -4.0, nullptr, true, 1.0);
+    CHECK_CLOSE(learner.q_value(decision->q_state, decision->q_action), -1.375, 1e-12);
+    auto successor = std::make_shared<DecisionSnapshot>();
+    learner.observe_arrival_transition(decision, -8.0, successor, false, 1.0);
+    std::ostringstream output;
+    learner.write_reward_stats(output);
+    std::istringstream lines(output.str());
+    std::string line;
+    std::getline(lines, line);
+    int groups = 0;
+    while (std::getline(lines, line)) {
+        std::vector<std::string> fields;
+        std::istringstream row(line);
+        std::string field;
+        while (std::getline(row, field, ',')) fields.push_back(field);
+        CHECK(fields.size() == 18);
+        if (fields[5] == "1") {
+            CHECK(fields[8] == "2");
+            CHECK_CLOSE(std::stod(fields[9]), -3.0, 1e-12);
+            CHECK_CLOSE(std::stod(fields[10]), std::sqrt(2.0), 1e-12);
+            CHECK_CLOSE(std::stod(fields[11]), -4.0, 1e-12);
+            CHECK_CLOSE(std::stod(fields[12]), -2.0, 1e-12);
+        } else {
+            CHECK(fields[8] == "1");
+            CHECK_CLOSE(std::stod(fields[9]), -8.0, 1e-12);
+        }
+        ++groups;
+    }
+    CHECK(groups == 2);
+    learner.evaluation_mode = true;
+    learner.observe_arrival_transition(decision, -100.0, nullptr, true, 1.0);
+    std::ostringstream frozen;
+    learner.write_reward_stats(frozen);
+    CHECK(output.str() == frozen.str());
+}
+
+TEST(q_bootstrap_and_terminal_targets_match_hand_calculation) {
+    QLearningAllocator learner(1.0, 0.5);
+    auto pool = default_llm_pool();
+    auto gpus = create_gpu_pool(1, 1, 1);
+    Prompt prompt;
+    learner.allocate(prompt, gpus, pool, 0.0, nullptr);
+    auto successor = std::make_shared<DecisionSnapshot>();
+    successor->q_state = {4, 3, 2};
+    for (const auto& action : build_actions(pool)) {
+        successor->q_action = action;
+        learner.observe_arrival_transition(successor, -4.0, nullptr, true, 1.0);
+    }
+    auto decision = std::make_shared<DecisionSnapshot>();
+    decision->q_state = {0, 0, 0};
+    decision->q_action = {Size::SMALL, "gpu_small"};
+    std::ostringstream trace;
+    learner.set_td_trace(&trace);
+    learner.observe_arrival_transition(decision, -2.0, successor, false, 1.0);
+    CHECK_CLOSE(learner.q_value(decision->q_state, decision->q_action), -4.0, 1e-12);
+    learner.observe_arrival_transition(decision, -3.0, successor, true, 1.0);
+    CHECK_CLOSE(learner.q_value(decision->q_state, decision->q_action), -3.0, 1e-12);
+    auto before = trace.str();
+    CHECK(std::count(before.begin(), before.end(), '\n') == 3);
+    learner.evaluation_mode = true;
+    learner.observe_arrival_transition(decision, -100.0, nullptr, true, 1.0);
+    CHECK(trace.str() == before);
+    CHECK_CLOSE(learner.q_value(decision->q_state, decision->q_action), -3.0, 1e-12);
+    learner.set_td_trace(nullptr);
+}
+
+TEST(q_learns_known_cheapest_gpu_in_controlled_one_step_environment) {
+    QLearningAllocator learner(0.2, 0.0, 1.0, 1.0, 1.0, 5, 4, 3, 0.0, 42);
+    auto full_pool = default_llm_pool();
+    std::vector<LLM> pool{full_pool.front()};
+    auto gpus = create_gpu_pool(1, 1, 1);
+    Prompt prompt;
+    prompt.difficulty = 0.5;
+    std::map<Size, int> choices;
+    for (int episode = 0; episode < 1000; ++episode) {
+        learner.reset_for_episode();
+        auto decision = learner.allocate(prompt, gpus, pool, 0.0, nullptr);
+        CHECK(decision.has_value());
+        ++choices[decision->gpu->vram];
+        double cost = decision->gpu->vram == Size::SMALL ? 1.0 :
+                      decision->gpu->vram == Size::MEDIUM ? 5.0 : 9.0;
+        learner.observe_arrival_transition(learner.pop_last_decision(), -cost, nullptr, true, 1.0);
+    }
+    CHECK(choices[Size::SMALL] > 0);
+    CHECK(choices[Size::MEDIUM] > 0);
+    CHECK(choices[Size::LARGE] > 0);
+    learner.evaluation_mode = true;
+    for (int trial = 0; trial < 20; ++trial) {
+        auto decision = learner.allocate(prompt, gpus, pool, 0.0, nullptr);
+        CHECK(decision.has_value());
+        CHECK(decision->gpu->vram == Size::SMALL);
+    }
+}
+
+TEST(q_batched_state_tracks_real_work_and_detects_low_fill) {
+    QLearningAllocator learner;
+    auto gpus = create_gpu_pool(2, 2, 1);
+    Prompt prompt;
+    prompt.difficulty = 0.5;
+    EnvObservation observation;
+    for (const auto& gpu : gpus) {
+        GPUObservation state;
+        state.gpu_id = gpu.id;
+        state.capacity = 96;
+        observation.gpus.emplace(gpu.id, state);
+    }
+    auto state = [&]() { return learner.arrival_state(prompt, gpus, 10.0, &observation)->q_state; };
+    auto empty = state();
+    CHECK(std::get<1>(empty) == 0);
+    CHECK(std::get<2>(empty) == 0);
+    observation.gpus.begin()->second.active_count = 1;
+    auto light = state();
+    CHECK(std::get<1>(light) == 1);
+    CHECK(std::get<2>(light) == 1);
+    observation.gpus.begin()->second.active_count = 96;
+    CHECK(std::get<2>(state()) == 2);
+    observation.gpus.begin()->second.active_count = 0;
+    observation.gpus.begin()->second.waiting_count = 1;
+    CHECK(std::get<1>(state()) == 3);
+    CHECK(std::get<2>(state()) == 0);
+    observation.gpus.begin()->second.waiting_count = 0;
+    for (auto& gpu : gpus) gpu.busy_until = 1000.0;
+    CHECK(state() == empty);
+    auto legacy = learner.arrival_state(prompt, gpus, 10.0, nullptr)->q_state;
+    CHECK(std::get<1>(legacy) == 3);
+}
+
+TEST(q_coverage_is_complete_and_frozen_during_evaluation) {
+    QLearningAllocator learner;
+    auto pool = default_llm_pool();
+    auto gpus = create_gpu_pool(1, 1, 1);
+    PromptGenerator generator(0.5, 0.2, 0.3, 128, 42);
+    auto prompts = generator.generate(12);
+    BatchedSimulator training(gpus, pool);
+    training.run(learner, prompts, true);
+    std::ostringstream before;
+    learner.write_visits(before);
+    auto csv = before.str();
+    CHECK(std::count(csv.begin(), csv.end(), '\n') == 1081);
+    learner.reset_for_episode();
+    learner.evaluation_mode = true;
+    BatchedSimulator evaluation(gpus, pool);
+    evaluation.run(learner, prompts, false);
+    std::ostringstream after;
+    learner.write_visits(after);
+    CHECK(before.str() == after.str());
+}
+
+TEST(consolidate_small_ignores_load_and_uses_stable_lowest_tier) {
+    auto pool = default_llm_pool();
+    std::reverse(pool.begin(), pool.end());
+    std::vector<GPU> gpus = {GPU(5, Size::LARGE), GPU(3, Size::SMALL), GPU(1, Size::SMALL)};
+    gpus.back().busy_until = 1000.0;
+    ConsolidateSmallAllocator allocator;
+    Prompt prompt;
+    auto decision = allocator.allocate(prompt, gpus, pool, 0.0, nullptr);
+    CHECK(decision.has_value());
+    CHECK(decision->gpu->id == 1);
+    CHECK(decision->llm.size == Size::SMALL);
+    std::vector<GPU> fallback = {GPU(5, Size::LARGE), GPU(3, Size::MEDIUM)};
+    decision = allocator.allocate(prompt, fallback, pool, 0.0, nullptr);
+    CHECK(decision.has_value());
+    CHECK(decision->gpu->id == 3);
+    std::vector<GPU> empty;
+    CHECK(!allocator.allocate(prompt, empty, pool, 0.0, nullptr).has_value());
+}
+
+TEST(arrival_transition_uses_next_prompt_state) {
+    class RecordingLearner : public QLearningAllocator {
+    public:
+        int transitions = 0;
+        int terminals = 0;
+        int next_difficulty_bin = -1;
+        void observe_arrival_transition(const std::shared_ptr<DecisionSnapshot>& decision,
+            double reward, const std::shared_ptr<DecisionSnapshot>& successor,
+            bool done, double elapsed) override {
+            ++transitions;
+            if (done) ++terminals;
+            else {
+                CHECK(successor != nullptr);
+                next_difficulty_bin = std::get<0>(successor->q_state);
+            }
+            QLearningAllocator::observe_arrival_transition(decision, reward, successor, done, elapsed);
+        }
+    };
+    RecordingLearner learner;
+    Prompt easy;
+    easy.difficulty = 0.1;
+    easy.input_tokens = 128;
+    Prompt hard = easy;
+    hard.id = 1;
+    hard.arrival_time = 0.1;
+    hard.difficulty = 1.0;
+    BatchedSimulator simulator(create_gpu_pool(1, 1, 1), default_llm_pool());
+    simulator.run(learner, {easy, hard}, true);
+    CHECK(learner.transitions == 2);
+    CHECK(learner.terminals == 1);
+    CHECK(learner.next_difficulty_bin == 4);
+}
+
+TEST(arrival_rewards_cover_idle_wake_and_terminal_drain) {
+    auto pool = default_llm_pool();
+    BatchedConfig config{RewardWeights::profile("energy")};
+    config.sleep_timeout = 0.1;
+    BatchedSimulator simulator(create_gpu_pool(1, 1, 1), pool, config);
+    Prompt first;
+    first.input_tokens = 64;
+    first.difficulty = 0.4;
+    first.arrival_time = 1.0;
+    Prompt second = first;
+    second.id = 1;
+    second.arrival_time = 20.0;
+    Prompt third = second;
+    third.id = 2;
+    AlwaysSmallAllocator allocator(42);
+    auto results = simulator.run(allocator, {first, second, third});
+    CHECK(results.size() == 3);
+    CHECK(simulator.arrival_transitions.size() == 3);
+    CHECK(simulator.arrival_transitions.back().terminal);
+    CHECK(simulator.arrival_transitions.back().elapsed > 0.0);
+    CHECK_CLOSE(simulator.arrival_transitions[1].elapsed, 0.0, 1e-9);
+    CHECK(simulator.sleep_energy > 0.0);
+    CHECK(simulator.wake_energy > 0.0);
+    double interval_energy = 0.0, interval_reward = 0.0;
+    for (const auto& transition : simulator.arrival_transitions) {
+        interval_energy += transition.energy;
+        interval_reward += transition.reward;
+    }
+    double job_energy = 0.0, job_reward = 0.0;
+    for (const auto& result : results) {
+        job_energy += result.energy;
+        job_reward += result.reward;
+    }
+    double physical = simulator.active_energy + simulator.idle_energy +
+                      simulator.sleep_energy + simulator.wake_energy;
+    CHECK_CLOSE(interval_energy, physical, 1e-7);
+    CHECK_CLOSE(job_energy, physical, 1e-7);
+    CHECK_CLOSE(interval_reward, job_reward, 1e-7);
+    CHECK_CLOSE(simulator.total_idle_energy, 0.0, 1e-7);
+}
+
+TEST(energy_integrates_changing_batches_without_double_charging) {
+    auto pool = default_llm_pool();
+    GPU gpu(0, Size::SMALL);
+    BatchedConfig config;
+    config.power_management = false;
+    Prompt short_prompt;
+    short_prompt.id = 0;
+    short_prompt.input_tokens = 16;
+    short_prompt.difficulty = 0.4;
+    Prompt long_prompt = short_prompt;
+    long_prompt.id = 1;
+    long_prompt.input_tokens = 1024;
+    BatchedSimulator simulator({gpu}, pool, config);
+    AlwaysSmallAllocator allocator(42);
+    auto results = simulator.run(allocator, {short_prompt, long_prompt});
+    CHECK(results.size() == 2);
+    double total = 0.0;
+    double short_end = 0.0, long_end = 0.0;
+    for (const auto& result : results) {
+        total += result.energy;
+        if (result.prompt.id == 0) short_end = result.end_time;
+        else long_end = result.end_time;
+    }
+    int capacity = gpu.kv_cache_slots(pool[0]);
+    double expected = short_end * step_power(gpu, 2, capacity) +
+                      (long_end - short_end) * step_power(gpu, 1, capacity);
+    CHECK_CLOSE(total, expected, 1e-7);
+    CHECK_CLOSE(simulator.total_idle_energy, 0.0, 1e-7);
+    CHECK_CLOSE(simulator.accounting_error, 0.0, 1e-7);
+}
+
+TEST(frozen_dqn_evaluation_is_repeatable_and_preserves_replay) {
+    auto pool = default_llm_pool();
+    auto gpus = create_gpu_pool(1, 1, 1);
+    PromptGenerator generator(0.5, 0.2, 0.3, 128, 42);
+    auto prompts = generator.generate(12);
+    DQNAllocator allocator(1.0, 0.995, 0.01, 0.95, 1e-3, 8, 200, 50, 64, 0.0, 42);
+    BatchedSimulator training(gpus, pool);
+    training.run(allocator, prompts, true);
+    auto replay_before = allocator.replay_size();
+    CHECK(replay_before == prompts.size());
+    auto epsilon_before = allocator.epsilon();
+    allocator.reset_for_episode();
+    allocator.evaluation_mode = true;
+    BatchedSimulator first(gpus, pool), second(gpus, pool);
+    auto first_results = first.run(allocator, prompts, false);
+    allocator.reset_for_episode();
+    auto second_results = second.run(allocator, prompts, false);
+    CHECK(first_results.size() == second_results.size());
+    for (size_t index = 0; index < first_results.size(); ++index) {
+        CHECK(first_results[index].gpu.id == second_results[index].gpu.id);
+        CHECK(first_results[index].llm.name == second_results[index].llm.name);
+        CHECK_CLOSE(first_results[index].reward, second_results[index].reward, 1e-9);
+    }
+    CHECK(allocator.replay_size() == replay_before);
+    CHECK_CLOSE(allocator.epsilon(), epsilon_before, 1e-12);
+}
 
 // --------------- domain: KV-cache --------------------------------------
 TEST(kv_bigger_gpu_more_slots) {

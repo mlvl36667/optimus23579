@@ -222,11 +222,29 @@ std::vector<std::unique_ptr<Allocator>> all_heuristic_allocators(uint64_t seed) 
     std::vector<std::unique_ptr<Allocator>> v;
     v.push_back(std::make_unique<RandomAllocator>(seed));
     v.push_back(std::make_unique<AlwaysSmallAllocator>(seed));
+    v.push_back(std::make_unique<ConsolidateSmallAllocator>());
     v.push_back(std::make_unique<AlwaysLargeAllocator>(seed));
     v.push_back(std::make_unique<DifficultyAllocator>(seed));
     v.push_back(std::make_unique<LeastLoadedAllocator>());
     v.push_back(std::make_unique<EnergyAwareAllocator>());
     return v;
+}
+
+std::optional<AllocationDecision> ConsolidateSmallAllocator::allocate(
+    const Prompt&, std::vector<GPU>& gpus, const std::vector<LLM>& pool,
+    double, const EnvObservation*) {
+    if (pool.empty()) return std::nullopt;
+    const auto model = std::min_element(pool.begin(), pool.end(), [](const LLM& left, const LLM& right) {
+        return size_value(left.size) < size_value(right.size);
+    });
+    GPU* target = nullptr;
+    for (auto& gpu : gpus) {
+        if (!model->fits_on(gpu)) continue;
+        if (!target || size_value(gpu.vram) < size_value(target->vram) ||
+            (gpu.vram == target->vram && gpu.id < target->id)) target = &gpu;
+    }
+    if (!target) return std::nullopt;
+    return AllocationDecision(target, *model);
 }
 
 }  // namespace llm_alloc

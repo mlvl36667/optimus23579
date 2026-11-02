@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <ostream>
 #include <random>
 #include <string>
 #include <tuple>
@@ -117,14 +118,37 @@ public:
                             bool done, std::optional<double> holding_time) override;
 
     int state_space_size() const { return n_diff_bins_ * n_load_bins_ * n_batch_bins_; }
+    std::shared_ptr<DecisionSnapshot> arrival_state(const Prompt&, const std::vector<GPU>&,
+        double, const EnvObservation*) override;
+    void observe_arrival_transition(const std::shared_ptr<DecisionSnapshot>&, double,
+        const std::shared_ptr<DecisionSnapshot>&, bool, double) override;
     int action_space_size() const { return actions_ ? static_cast<int>(actions_->size()) : 0; }
     size_t q_size() const { return q_.size(); }
     double effective_gamma(std::optional<double> holding_time) const;
     void set_epsilon(double e) { epsilon_ = e; }
+    void write_visits(std::ostream& output) const;
 
     using State = std::tuple<int, int, int>;
+    double q_value(const State& state, const Action& action) const;
+    void set_td_trace(std::ostream* output);
+    void write_reward_stats(std::ostream& output) const;
 
 private:
+    struct Moments {
+        uint64_t count = 0;
+        double mean = 0.0, squared_deviations = 0.0;
+        double minimum = 0.0, maximum = 0.0;
+        void add(double value);
+        double stddev() const;
+    };
+    struct RewardStats {
+        Moments reward, target, td_error, absolute_td_error;
+    };
+    std::map<std::tuple<State, Action, bool, uint64_t>, RewardStats> reward_stats_;
+    void apply_td(const State&, const Action&, double reward, double bootstrap,
+                  double discount, bool terminal);
+    std::ostream* td_trace_ = nullptr;
+    uint64_t td_update_count_ = 0;
     State get_state(const Prompt& prompt, const std::vector<GPU>& gpus,
                     double current_time, const EnvObservation* env_state) const;
     double max_q(const State& state) const;
@@ -135,6 +159,8 @@ private:
     std::mt19937_64 rng_;
 
     std::map<State, std::map<Action, double>> q_;
+    std::map<State, std::map<Action, uint64_t>> visits_;
+    std::map<State, std::map<Action, uint64_t>> updates_;
     std::optional<State> prev_state_;
     std::optional<Action> prev_action_;
     std::optional<double> prev_reward_;
@@ -177,6 +203,10 @@ public:
                             bool done, std::optional<double> holding_time) override;
 
     int state_dim() const { return state_dim_; }
+    std::shared_ptr<DecisionSnapshot> arrival_state(const Prompt&, const std::vector<GPU>&,
+        double, const EnvObservation*) override;
+    void observe_arrival_transition(const std::shared_ptr<DecisionSnapshot>&, double,
+        const std::shared_ptr<DecisionSnapshot>&, bool, double) override;
     size_t replay_size() const { return replay_.size(); }
     double effective_gamma(std::optional<double> holding_time) const;
 

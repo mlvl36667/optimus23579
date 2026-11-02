@@ -59,6 +59,7 @@ struct DecisionSnapshot;  // defined in learning.hpp; carried via shared_ptr
 // ---------------------------------------------------------------------------
 class Allocator {
 public:
+    bool evaluation_mode = false;
     virtual ~Allocator() = default;
 
     // Pick a (GPU, LLM) pair for a prompt. Returns std::nullopt if no valid
@@ -76,6 +77,10 @@ public:
     virtual void update(double /*reward*/) {}
     virtual void end_episode() {}
     virtual double epsilon() const { return 0.0; }
+    virtual std::shared_ptr<DecisionSnapshot> arrival_state(
+        const Prompt&, const std::vector<GPU>&, double, const EnvObservation*) { return nullptr; }
+    virtual void observe_arrival_transition(const std::shared_ptr<DecisionSnapshot>&,
+        double reward, const std::shared_ptr<DecisionSnapshot>&, bool, double) { update(reward); }
 
     // Correct (s,a,r,s') interface for the batched engine.
     virtual bool supports_observe_transition() const { return false; }
