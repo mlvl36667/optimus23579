@@ -187,7 +187,8 @@ target_compile_definitions(llm_run PRIVATE
 )
 add_executable(llm_benchmark apps/benchmark_main.cpp)
 add_executable(llm_sweep     apps/sweep_main.cpp)
-foreach(_app llm_run llm_benchmark llm_sweep)
+add_executable(llm_shadow    apps/shadow_main.cpp)
+foreach(_app llm_run llm_benchmark llm_sweep llm_shadow)
   target_link_libraries(${_app} PRIVATE llm_alloc)
 endforeach()
 
@@ -202,3 +203,6 @@ add_executable(llm_tests
 )
 target_link_libraries(llm_tests PRIVATE llm_alloc)
 add_test(NAME llm_tests COMMAND llm_tests)
+add_test(NAME llm_shadow_smoke COMMAND llm_shadow
+  --episodes 2 --dual-period 1 --polish-episodes 1 --n-prompts 5 --eval-streams 2
+  --output ${CMAKE_CURRENT_BINARY_DIR}/shadow_smoke.json)

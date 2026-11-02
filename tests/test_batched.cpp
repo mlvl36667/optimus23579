@@ -11,8 +11,32 @@
 #include "llm_alloc/learning.hpp"
 #include "llm_alloc/metrics.hpp"
 #include "llm_alloc/simulator.hpp"
+#include "llm_alloc/shadow_price.hpp"
 
 using namespace llm_alloc;
+
+TEST(shadow_price_rises_on_violation_and_projects_at_zero) {
+    EnergyShadowPrice price(100.0, 0.1, 0.01);
+    price.update(1200.0, 10);
+    CHECK_CLOSE(price.price(), 0.3, 1e-12);
+    price.update(900.0, 10);
+    CHECK_CLOSE(price.price(), 0.2, 1e-12);
+    price.update(0.0, 10);
+    CHECK_CLOSE(price.price(), 0.0, 1e-12);
+    price.update(1000.0, 10);
+    CHECK_CLOSE(price.price(), 0.0, 1e-12);
+}
+
+TEST(shadow_price_uses_arrivals_not_episode_length) {
+    EnergyShadowPrice first(100.0, 0.1, 0.001);
+    EnergyShadowPrice second(100.0, 0.1, 0.001);
+    first.update(1200.0, 10);
+    second.update(2400.0, 20);
+    CHECK_CLOSE(first.price(), second.price(), 1e-12);
+    bool rejected = false;
+    try { first.update(0.0, 0); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+}
 
 TEST(q_reward_stats_separate_terminal_updates_and_use_sample_variance) {
     QLearningAllocator learner(0.25, 0.5);

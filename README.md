@@ -208,6 +208,85 @@ cmake --build . -j4
 
 ## Run
 
+### Energy constraint with a learned shadow price
+
+`llm_shadow` is an opt-in tabular Q-learning experiment. It minimizes the
+undiscounted episode service cost of the `quality` profile (latency and quality
+loss, without its fixed energy coefficient), subject to expected full-fleet
+energy per arrival being at most `--budget-j`. Gamma is 1 for both learned
+policies, matching the undiscounted constraint; the existing runners are unchanged.
+All arrivals must finish: dropped or incomplete workloads abort this experiment.
+
+For fixed lambda, training reward is `-(service_cost + lambda * energy)` per
+arrival interval, including idle, sleep, wake and final drain. The Lagrangian's
+`lambda * budget * number_of_arrivals` term is omitted because the arrival count
+is fixed, making that term policy-independent in the undiscounted episode sum.
+Every `--dual-period` episodes, projected dual ascent applies
+`lambda = max(0, lambda + dual_lr * (block_energy/block_arrivals - budget))`.
+Price remains fixed inside each block. A final `--polish-episodes` phase trains
+with the last price frozen, and evaluation freezes both price and policy.
+
+The equally trained `q_fixed_price` control keeps `--initial-price` throughout;
+seven heuristics are evaluated on the same held-out streams. The report separates
+service cost, energy, mean budget feasibility and the fraction of evaluation
+streams exceeding the budget; rewards under different prices are not ranked.
+History records price used/next and budget violation for every episode.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+./build/llm_shadow --budget-j 120 --episodes 600 --dual-period 20 \
+  --polish-episodes 200 --initial-price 0.1 --dual-lr 0.0005 \
+  --eval-streams 5 --seed 42 --output experiments/shadow/budget_120_seed_42.json
+```
+
+This is approximate primal-dual learning, not a feasibility guarantee. Changing
+lambda makes old tabular estimates stale; block updates and frozen-price polish
+mitigate but do not eliminate this issue. The observation remains partially
+observed and the finite horizon is not encoded. Infeasible budgets may cause price
+to grow without obtaining feasibility. One seed and a few held-out streams do not
+establish statistical reliability. DQN is deliberately not included: supporting
+adaptive prices there requires replay reward decomposition/relabeling or a
+price-conditioned value function rather than mixing old-price scalar rewards.
+
+Initial seed-42 check (600 adaptive + 200 polish episodes, five held-out streams):
+
+| Budget (J/arrival) | Final lambda | Shadow policy energy (J/arrival) | Mean feasible |
+| --- | --- | --- | --- |
+| 120 | 3.871 | 316.957 | no |
+| 150 | 3.381 | 322.639 | no |
+| 180 | 2.954 | 380.942 | no |
+
+Why did the learned policies exceed the budgets? Projected dual ascent penalizes
+violations; it does not prevent an allocation or enforce a hard execution budget.
+It relies on the inner learner finding a sufficiently good policy at each price.
+Here the price increased in response to excess energy, but the learned policies
+remained expensive. A feasible consolidation control exists on the evaluated
+streams, so these failures cannot be attributed simply to impossible budgets.
+
+Two plausible causes require separate experiments. First, the same Q table is
+reused when the price changes every 20 episodes, although earlier fixed-objective
+experiments needed hundreds of episodes to learn consolidation. Second, gamma=1
+was introduced to align with total episode cost, but the state does not encode
+remaining arrivals: one table entry mixes different remaining horizons. Neither
+cause is established by the controller arithmetic checks alone.
+
+The next diagnostic should hold lambda fixed with gamma=1 and determine whether
+the inner learner can learn an energy-efficient policy before adapting lambda.
+`q_fixed_price` in the existing runner is the matched control for this check;
+repeat runs at different `--initial-price` values and training durations, and
+inspect that policy's results separately from `q_shadow`. Only after this control
+works should slower dual updates or a horizon-aware state be evaluated. Hard
+per-episode energy enforcement would require a separate execution constraint.
+
+These runs validate controller direction and reporting but do not demonstrate
+successful constrained learning. The consolidation heuristic uses 106.387 J/arrival
+on these streams, so this failure is not evidence that the budgets are infeasible.
+The shadow prices are training iterates, not validated optimal marginal prices.
+The change to gamma=1 and changing tabular targets introduce additional learning
+difficulty compared with the earlier constant-discount experiments.
+
 ### Q-learning exploration and coverage experiment
 
 `--q-alpha X` sets the tabular learning rate (default 0.1; valid range `(0,1]`).
