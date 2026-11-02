@@ -288,6 +288,7 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
             const Prompt& prompt = prompts[pending_idx];
             pending_idx++;
             EnvObservation env_state = observe(states, t);
+            env_state.remaining_arrivals = prompts.size() - pending_idx + 1;
             auto successor = allocator.arrival_state(prompt, gpus_, t, &env_state);
             emit_transition(successor, false);
             auto decision = allocator.allocate(prompt, gpus_, llm_pool_, t, &env_state);

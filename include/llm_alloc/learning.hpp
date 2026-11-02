@@ -1,6 +1,7 @@
 // Learning allocators: epsilon-greedy bandit, tabular Q-learning, DQN (LibTorch).
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -117,7 +118,8 @@ public:
                             double reward, const EnvObservation* next_state,
                             bool done, std::optional<double> holding_time) override;
 
-    int state_space_size() const { return n_diff_bins_ * n_load_bins_ * n_batch_bins_; }
+    int state_space_size() const { return n_diff_bins_ * n_load_bins_ * n_batch_bins_ * std::max(1, horizon_steps_); }
+    void set_finite_horizon(int steps);
     std::shared_ptr<DecisionSnapshot> arrival_state(const Prompt&, const std::vector<GPU>&,
         double, const EnvObservation*) override;
     void observe_arrival_transition(const std::shared_ptr<DecisionSnapshot>&, double,
@@ -149,6 +151,7 @@ private:
                   double discount, bool terminal);
     std::ostream* td_trace_ = nullptr;
     uint64_t td_update_count_ = 0;
+    int horizon_steps_ = 0;
     State get_state(const Prompt& prompt, const std::vector<GPU>& gpus,
                     double current_time, const EnvObservation* env_state) const;
     double max_q(const State& state) const;

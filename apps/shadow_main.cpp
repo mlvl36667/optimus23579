@@ -25,6 +25,8 @@ struct Options {
     double budget = 120.0, initial_price = 0.1, dual_lr = 0.0005;
     int episodes = 600, dual_period = 20, polish = 200, prompts = 200, eval_streams = 5;
     uint64_t seed = 42;
+    bool horizon_state = true;
+    std::string mode = "adaptive";
     std::string output = "experiments/shadow/result.json";
 };
 
@@ -35,6 +37,7 @@ Options parse(int argc, char** argv) {
         if (index + 1 >= argc) throw std::invalid_argument("Missing value for " + name);
         std::string value = argv[++index];
         if (name == "--output") { options.output = value; continue; }
+        if (name == "--mode") { options.mode = value; continue; }
         size_t consumed = 0;
         double number = std::stod(value, &consumed);
         if (consumed != value.size() || !std::isfinite(number)) throw std::invalid_argument("Invalid value for " + name);
@@ -51,12 +54,15 @@ Options parse(int argc, char** argv) {
             else if (name == "--n-prompts") options.prompts = integer;
             else if (name == "--eval-streams") options.eval_streams = integer;
             else if (name == "--seed") options.seed = integer;
+            else if (name == "--horizon-state" && integer <= 1) options.horizon_state = integer != 0;
             else throw std::invalid_argument("Unknown option " + name);
         }
     }
     if (options.episodes <= 0 || options.dual_period <= 0 || options.polish < 0 ||
         options.prompts <= 0 || options.eval_streams <= 0)
         throw std::invalid_argument("Episodes, period, prompts and evaluation streams must be positive");
+    if (options.mode != "fixed" && options.mode != "adaptive")
+        throw std::invalid_argument("--mode must be fixed or adaptive");
     return options;
 }
 
@@ -88,6 +94,7 @@ int main(int argc, char** argv) {
         std::printf("Usage: llm_shadow [--budget-j 120] [--initial-price 0.1] [--dual-lr 0.0005]\n"
                     "  [--episodes 600] [--dual-period 20] [--polish-episodes 200]\n"
                     "  [--n-prompts 200] [--eval-streams 5] [--seed 42] [--output PATH]\n"
+                    "  [--mode adaptive|fixed] [--horizon-state 0|1] (default 1)\n"
                     "Tabular Q-learning only; undiscounted quality/latency service cost, 2+2+1 GPUs.\n");
         return 0;
     }
@@ -97,18 +104,23 @@ int main(int argc, char** argv) {
         torch::set_num_threads(1);
         QLearningAllocator shadow(0.1, 1.0, 0.2, 0.998, 0.01, 5, 4, 3, 0.0, options.seed);
         QLearningAllocator fixed(0.1, 1.0, 0.2, 0.998, 0.01, 5, 4, 3, 0.0, options.seed);
+        if (options.horizon_state) {
+            shadow.set_finite_horizon(options.prompts);
+            fixed.set_finite_horizon(options.prompts);
+        }
         json history = json::array();
         double block_energy = 0.0;
         size_t block_arrivals = 0;
-        std::printf("Shadow price: budget=%.3f J/arrival, quality profile service cost, gamma=1, seed=%llu\n",
-                    options.budget, static_cast<unsigned long long>(options.seed));
+        std::printf("Shadow price: budget=%.3f J/arrival, quality profile service cost, gamma=1, seed=%llu mode=%s horizon=%s states=%d\n",
+                    options.budget, static_cast<unsigned long long>(options.seed), options.mode.c_str(),
+                    options.horizon_state ? "remaining-arrivals" : "none", shadow.state_space_size());
         for (int episode = 0; episode < options.episodes + options.polish; ++episode) {
             PromptGenerator generator(0.5, 0.2, 1.0, 256, options.seed + episode);
             auto prompts = generator.generate(options.prompts);
             double used_price = controller.price();
             auto measured = run(shadow, used_price, prompts, true);
             run(fixed, options.initial_price, prompts, true);
-            bool adapting = episode < options.episodes;
+            bool adapting = options.mode == "adaptive" && episode < options.episodes;
             if (adapting) {
                 block_energy += measured.energy;
                 block_arrivals += prompts.size();
@@ -118,7 +130,8 @@ int main(int argc, char** argv) {
                     block_arrivals = 0;
                 }
             }
-            history.push_back({{"episode", episode}, {"phase", adapting ? "dual" : "frozen_price_polish"},
+            const char* phase = options.mode == "fixed" ? "fixed_price" : adapting ? "dual" : "frozen_price_polish";
+            history.push_back({{"episode", episode}, {"phase", phase},
                 {"price_used", used_price}, {"price_next", controller.price()},
                 {"energy_j_per_arrival", measured.energy / options.prompts},
                 {"service_cost_per_arrival", measured.service / options.prompts},
@@ -126,7 +139,7 @@ int main(int argc, char** argv) {
                 {"quality", measured.quality}, {"latency_s", measured.latency}});
             if ((episode + 1) % options.dual_period == 0 || episode + 1 == options.episodes + options.polish) {
                 std::printf("ep=%d phase=%s price=%.6f -> %.6f energy=%.3f quality=%.3f\n",
-                    episode + 1, adapting ? "dual" : "polish", used_price, controller.price(),
+                    episode + 1, phase, used_price, controller.price(),
                     measured.energy / options.prompts, measured.quality);
                 std::fflush(stdout);
             }
@@ -167,7 +180,8 @@ int main(int argc, char** argv) {
             {"final_price", controller.price()}, {"dual_lr", options.dual_lr}, {"dual_period", options.dual_period},
             {"episodes", options.episodes}, {"polish_episodes", options.polish}, {"n_prompts", options.prompts},
             {"seed", options.seed}, {"eval_streams", options.eval_streams},
-            {"gamma", 1.0}, {"service_profile", "quality"},
+            {"gamma", 1.0}, {"service_profile", "quality"}, {"mode", options.mode},
+            {"horizon_state", options.horizon_state}, {"tabular_states", shadow.state_space_size()},
             {"history", history}, {"evaluation", evaluation}};
         auto parent = std::filesystem::path(options.output).parent_path();
         if (!parent.empty()) std::filesystem::create_directories(parent);

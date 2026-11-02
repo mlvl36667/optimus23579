@@ -15,6 +15,51 @@
 
 using namespace llm_alloc;
 
+TEST(finite_horizon_distinguishes_identical_fleets_at_different_stages) {
+    QLearningAllocator learner;
+    learner.set_finite_horizon(3);
+    CHECK(learner.state_space_size() == 180);
+    auto gpus = create_gpu_pool(1, 1, 1);
+    Prompt prompt;
+    prompt.difficulty = 0.5;
+    EnvObservation observation;
+    observation.remaining_arrivals = 3;
+    auto early = learner.arrival_state(prompt, gpus, 0.0, &observation);
+    observation.remaining_arrivals = 1;
+    auto late = learner.arrival_state(prompt, gpus, 0.0, &observation);
+    CHECK(early->q_state != late->q_state);
+    CHECK(std::get<1>(early->q_state) == 8);
+    CHECK(std::get<1>(late->q_state) == 0);
+    bool rejected = false;
+    try { learner.observe_arrival_transition(early, -1.0, late, false, 0.0); }
+    catch (const std::logic_error&) { rejected = true; }
+    CHECK(rejected);
+}
+
+TEST(finite_horizon_simulator_handles_simultaneous_arrivals_and_final_drain) {
+    QLearningAllocator learner(0.1, 1.0, 0.2, 0.998, 0.01, 5, 4, 3, 0.0, 42);
+    learner.set_finite_horizon(3);
+    std::vector<Prompt> prompts(3);
+    for (int index = 0; index < 3; ++index) {
+        prompts[index].id = index;
+        prompts[index].difficulty = 0.5;
+        prompts[index].input_tokens = 64;
+    }
+    BatchedSimulator simulator(create_gpu_pool(1, 1, 1), default_llm_pool());
+    auto results = simulator.run(learner, prompts, true);
+    CHECK(results.size() == 3);
+    CHECK(simulator.arrival_transitions.size() == 3);
+    CHECK(simulator.arrival_transitions.back().terminal);
+    CHECK_CLOSE(simulator.arrival_transitions[0].elapsed, 0.0, 1e-12);
+    std::ostringstream diagnostics;
+    learner.write_visits(diagnostics);
+    CHECK(diagnostics.str().find("q_value,remaining_arrivals\n") != std::string::npos);
+    learner.reset_for_episode();
+    learner.evaluation_mode = true;
+    BatchedSimulator evaluation(create_gpu_pool(1, 1, 1), default_llm_pool());
+    CHECK(evaluation.run(learner, prompts, false).size() == 3);
+}
+
 TEST(shadow_price_rises_on_violation_and_projects_at_zero) {
     EnergyShadowPrice price(100.0, 0.1, 0.01);
     price.update(1200.0, 10);

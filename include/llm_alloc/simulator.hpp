@@ -41,6 +41,7 @@ struct GPUObservation {
 
 struct EnvObservation {
     double time = 0.0;
+    std::optional<size_t> remaining_arrivals;
     std::map<int, GPUObservation> gpus;
 
     const GPUObservation* get(int gpu_id) const {

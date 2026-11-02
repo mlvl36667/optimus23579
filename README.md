@@ -244,7 +244,7 @@ ctest --test-dir build --output-on-failure
 This is approximate primal-dual learning, not a feasibility guarantee. Changing
 lambda makes old tabular estimates stale; block updates and frozen-price polish
 mitigate but do not eliminate this issue. The observation remains partially
-observed and the finite horizon is not encoded. Infeasible budgets may cause price
+observed; legacy `--horizon-state 0` also omits the finite horizon. Infeasible budgets may cause price
 to grow without obtaining feasibility. One seed and a few held-out streams do not
 establish statistical reliability. DQN is deliberately not included: supporting
 adaptive prices there requires replay reward decomposition/relabeling or a
@@ -279,6 +279,40 @@ repeat runs at different `--initial-price` values and training durations, and
 inspect that policy's results separately from `q_shadow`. Only after this control
 works should slower dual updates or a horizon-aware state be evaluated. Hard
 per-episode energy enforcement would require a separate execution constraint.
+
+#### Finite-horizon and fresh fixed-price controls
+
+`llm_shadow` now defaults to `--horizon-state 1`. The batched observation supplies
+the exact number of remaining arrivals, including the current one. Tabular states
+distinguish all remaining counts, so an undiscounted early-decision estimate no
+longer shares a table entry with the final-decision estimate. Same-tick arrivals
+still decrement the count, and the final decision includes the fleet drain with
+no bootstrap. This removes horizon aliasing, not hidden GPU/model-state aliasing.
+
+The existing three-coordinate state key packs the horizon into its load coordinate
+internally; CSV diagnostics decode the load and append `remaining_arrivals` when
+enabled. `llm_run` and existing sweep experiments retain the original 60 states.
+With 200 arrivals, the shadow experiment has 12,000 possible states: this increases
+sample requirements and does not guarantee better performance at a fixed budget.
+
+`--mode fixed` disables dual updates entirely. Both learners start with fresh Q
+tables and use `--initial-price` from their first training episode. Compare horizon
+off/on at the same fixed price to isolate the state change from adaptive-price
+history. Use a new output name to preserve earlier results:
+
+```bash
+for horizon in 0 1; do
+  ./build/llm_shadow --mode fixed --horizon-state "$horizon" \
+    --initial-price 3.870829 --budget-j 120 --episodes 2600 \
+    --polish-episodes 0 --eval-streams 5 --seed 42 \
+    --output "experiments/shadow/fixed_3p87_horizon_${horizon}_seed_42.json" || exit 1
+done
+```
+
+These are diagnostic controls, not evidence that the adaptive controller converges.
+The default adaptive mode retains block updates and frozen-price polish, now with
+the optional finite-horizon state. Reports record `mode`, `horizon_state` and
+`tabular_states` so old and new experiments can be distinguished.
 
 These runs validate controller direction and reporting but do not demonstrate
 successful constrained learning. The consolidation heuristic uses 106.387 J/arrival

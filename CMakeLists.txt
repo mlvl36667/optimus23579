@@ -206,3 +206,7 @@ add_test(NAME llm_tests COMMAND llm_tests)
 add_test(NAME llm_shadow_smoke COMMAND llm_shadow
   --episodes 2 --dual-period 1 --polish-episodes 1 --n-prompts 5 --eval-streams 2
   --output ${CMAKE_CURRENT_BINARY_DIR}/shadow_smoke.json)
+add_test(NAME llm_shadow_fixed_smoke COMMAND llm_shadow
+  --mode fixed --horizon-state 1 --initial-price 3.870829
+  --episodes 2 --dual-period 1 --polish-episodes 0 --n-prompts 5 --eval-streams 2
+  --output ${CMAKE_CURRENT_BINARY_DIR}/shadow_fixed_smoke.json)

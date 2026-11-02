@@ -310,9 +310,16 @@ QLearningAllocator::State QLearningAllocator::get_state(
     const Prompt& prompt, const std::vector<GPU>& gpus, double current_time,
     const EnvObservation* env_state) const {
     int d_bin = discretise(prompt.difficulty, 0.1, 1.0, n_diff_bins_);
+    int horizon_offset = 0;
+    if (horizon_steps_ > 0) {
+        if (!env_state || !env_state->remaining_arrivals || *env_state->remaining_arrivals == 0 ||
+            *env_state->remaining_arrivals > static_cast<size_t>(horizon_steps_))
+            throw std::invalid_argument("Finite-horizon state requires a valid remaining-arrival count");
+        horizon_offset = static_cast<int>(*env_state->remaining_arrivals - 1) * n_load_bins_;
+    }
     if (env_state != nullptr) {
         auto bins = tabular_batch_bins(*env_state, n_load_bins_, n_batch_bins_);
-        return State{d_bin, bins.first, bins.second};
+        return State{d_bin, bins.first + horizon_offset, bins.second};
     }
     double load = system_load(gpus, current_time);
     int l_bin = discretise(load, 0.0, 1.0, n_load_bins_);
@@ -404,6 +411,12 @@ void QLearningAllocator::observe_arrival_transition(
     const std::shared_ptr<DecisionSnapshot>& successor, bool done, double elapsed) {
     if (evaluation_mode || !decision) return;
     if (!done && !successor) throw std::invalid_argument("Nonterminal Q transition requires a successor state");
+    if (horizon_steps_ > 0) {
+        int remaining_after = std::get<1>(decision->q_state) / n_load_bins_;
+        if ((done && remaining_after != 0) ||
+            (!done && std::get<1>(successor->q_state) / n_load_bins_ != remaining_after - 1))
+            throw std::logic_error("Finite-horizon transition must advance exactly one arrival, then drain");
+    }
     apply_td(decision->q_state, decision->q_action, reward,
              done ? 0.0 : max_q(successor->q_state), effective_gamma(elapsed), done);
     epsilon_ = std::max(epsilon_min_, epsilon_ * epsilon_decay_);
@@ -413,6 +426,7 @@ void QLearningAllocator::observe_transition(
     const std::shared_ptr<DecisionSnapshot>& decision, double reward,
     const EnvObservation* next_state, bool done, std::optional<double> holding_time) {
     if (evaluation_mode || !decision) return;
+    if (horizon_steps_ > 0) throw std::logic_error("Finite-horizon Q-learning requires arrival transitions");
     const State& s = decision->q_state;
     const Action& a = decision->q_action;
     epsilon_ = std::max(epsilon_min_, epsilon_ * epsilon_decay_);
@@ -435,10 +449,12 @@ void QLearningAllocator::update(double reward) {
 }
 
 void QLearningAllocator::write_visits(std::ostream& output) const {
-    output << "difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,visits,updates,q_value\n";
+    output << "difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,visits,updates,q_value";
+    if (horizon_steps_ > 0) output << ",remaining_arrivals";
+    output << '\n';
     if (!actions_) return;
     for (int difficulty = 0; difficulty < n_diff_bins_; ++difficulty) {
-        for (int load = 0; load < n_load_bins_; ++load) {
+        for (int load = 0; load < n_load_bins_ * std::max(1, horizon_steps_); ++load) {
             for (int batch = 0; batch < n_batch_bins_; ++batch) {
                 State state{difficulty, load, batch};
                 for (const auto& action : *actions_) {
@@ -448,9 +464,11 @@ void QLearningAllocator::write_visits(std::ostream& output) const {
                         auto entry = found->second.find(action);
                         return entry == found->second.end() ? 0.0 : static_cast<double>(entry->second);
                     };
-                    output << difficulty << ',' << load << ',' << batch << ','
+                    output << difficulty << ',' << load % n_load_bins_ << ',' << batch << ','
                            << size_name(action.first) << ',' << action.second << ','
-                           << lookup(visits_) << ',' << lookup(updates_) << ',' << lookup(q_) << '\n';
+                           << lookup(visits_) << ',' << lookup(updates_) << ',' << lookup(q_);
+                    if (horizon_steps_ > 0) output << ',' << load / n_load_bins_ + 1;
+                    output << '\n';
                 }
             }
         }
@@ -464,9 +482,21 @@ double QLearningAllocator::q_value(const State& state, const Action& action) con
     return entry == found->second.end() ? 0.0 : entry->second;
 }
 
+void QLearningAllocator::set_finite_horizon(int steps) {
+    if (steps <= 0 || steps > 1000000)
+        throw std::invalid_argument("Finite horizon must be between 1 and 1000000 arrivals");
+    if (!q_.empty() || !visits_.empty())
+        throw std::logic_error("Set the horizon before training, using a fresh Q table");
+    horizon_steps_ = steps;
+}
+
 void QLearningAllocator::set_td_trace(std::ostream* output) {
     td_trace_ = output;
-    if (td_trace_) *td_trace_ << "update,difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,reward,bootstrap,discount,target,td_error,q_before,q_after,alpha,epsilon,terminal\n";
+    if (td_trace_) {
+        *td_trace_ << "update,difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,reward,bootstrap,discount,target,td_error,q_before,q_after,alpha,epsilon,terminal";
+        if (horizon_steps_ > 0) *td_trace_ << ",remaining_arrivals";
+        *td_trace_ << '\n';
+    }
 }
 
 void QLearningAllocator::Moments::add(double value) {
@@ -485,19 +515,23 @@ double QLearningAllocator::Moments::stddev() const {
 
 void QLearningAllocator::write_reward_stats(std::ostream& output) const {
     output.precision(17);
-    output << "difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,terminal,window_start,window_end,count,reward_mean,reward_stddev,reward_min,reward_max,target_mean,target_stddev,td_mean,td_stddev,abs_td_mean\n";
+    output << "difficulty_bin,load_bin,batch_bin,model_size,gpu_rule,terminal,window_start,window_end,count,reward_mean,reward_stddev,reward_min,reward_max,target_mean,target_stddev,td_mean,td_stddev,abs_td_mean";
+    if (horizon_steps_ > 0) output << ",remaining_arrivals";
+    output << '\n';
     for (const auto& entry : reward_stats_) {
         const auto& state = std::get<0>(entry.first);
         const auto& action = std::get<1>(entry.first);
         auto window = std::get<3>(entry.first);
         const auto& stats = entry.second;
-        output << std::get<0>(state) << ',' << std::get<1>(state) << ',' << std::get<2>(state)
+        output << std::get<0>(state) << ',' << std::get<1>(state) % n_load_bins_ << ',' << std::get<2>(state)
             << ',' << size_name(action.first) << ',' << action.second << ',' << std::get<2>(entry.first)
             << ',' << window * 5000 + 1 << ',' << std::min((window + 1) * 5000, td_update_count_)
             << ',' << stats.reward.count << ',' << stats.reward.mean << ',' << stats.reward.stddev()
             << ',' << stats.reward.minimum << ',' << stats.reward.maximum << ',' << stats.target.mean
             << ',' << stats.target.stddev() << ',' << stats.td_error.mean << ',' << stats.td_error.stddev()
-            << ',' << stats.absolute_td_error.mean << '\n';
+            << ',' << stats.absolute_td_error.mean;
+        if (horizon_steps_ > 0) output << ',' << std::get<1>(state) / n_load_bins_ + 1;
+        output << '\n';
     }
 }
 
@@ -518,10 +552,12 @@ void QLearningAllocator::apply_td(const State& state, const Action& action,
     if (td_trace_) {
         td_trace_->precision(17);
         *td_trace_ << td_update_count_ << ',' << std::get<0>(state) << ','
-            << std::get<1>(state) << ',' << std::get<2>(state) << ','
+            << std::get<1>(state) % n_load_bins_ << ',' << std::get<2>(state) << ','
             << size_name(action.first) << ',' << action.second << ',' << reward << ','
             << bootstrap << ',' << discount << ',' << target << ',' << error << ','
-            << before << ',' << value << ',' << alpha_ << ',' << epsilon_ << ',' << terminal << '\n';
+            << before << ',' << value << ',' << alpha_ << ',' << epsilon_ << ',' << terminal;
+        if (horizon_steps_ > 0) *td_trace_ << ',' << std::get<1>(state) / n_load_bins_ + 1;
+        *td_trace_ << '\n';
     }
 }
 
