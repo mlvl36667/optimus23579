@@ -172,12 +172,27 @@ python3 tools/measure_ollama.py \
 - **LibTorch** 2.4.1 (CPU). The build prefers a CPU-only LibTorch at
   `$HOME/.local/lib/libtorch`; otherwise it falls back to the `torch` pip
   package. Override explicitly with `-DTorch_DIR=/path/to/share/cmake/Torch`.
-  The pip wheels use the pre-C++11 string ABI, so the project is compiled with
-  `-D_GLIBCXX_USE_CXX11_ABI=0` (carried automatically via `TORCH_CXX_FLAGS`).
+  The project uses `TORCH_CXX_FLAGS` to match the installed Torch C++ ABI.
 - **nlohmann/json** (header-only; the system install at `/usr/include` is used
   for the benchmark/sweep JSON export).
 
 ## Build
+
+If LibTorch is not already installed, install CPU PyTorch in a virtual
+environment from the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+On Debian/Ubuntu, install `python3-venv` if virtual environment creation fails.
+CMake detects Torch using the active Python environment. You can select an
+interpreter explicitly with `-DPython3_EXECUTABLE=/absolute/path/to/.venv/bin/python`.
+Alternatively, pass `-DTorch_DIR=/path/to/torch/share/cmake/Torch`.
+
+From the repository root, configure and build (only build after configuration succeeds):
 
 ```bash
 mkdir -p build && cd build

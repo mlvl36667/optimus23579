@@ -15,7 +15,7 @@ endif()
 # Point Torch_DIR at the cmake package shipped with the pip `torch` wheel if
 # the caller did not supply one explicitly.  Override with:
 #   cmake -DTorch_DIR=/path/to/torch/share/cmake/Torch ..
-if(NOT DEFINED Torch_DIR)
+if(NOT Torch_DIR)
   # Prefer a CPU-only LibTorch if present (avoids the CUDA toolkit requirement
   # that the pip cu121 wheel imposes).  Fall back to the pip torch package.
   set(_CPU_TORCH "$ENV{HOME}/.local/lib/libtorch/share/cmake/Torch")
@@ -23,15 +23,27 @@ if(NOT DEFINED Torch_DIR)
     set(Torch_DIR "${_CPU_TORCH}")
     message(STATUS "Using CPU LibTorch: ${Torch_DIR}")
   else()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     execute_process(
-      COMMAND python3 -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'share', 'cmake', 'Torch'))"
+      COMMAND "${Python3_EXECUTABLE}" -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'share', 'cmake', 'Torch'))"
       OUTPUT_VARIABLE _TORCH_CMAKE_DIR
+      ERROR_VARIABLE _TORCH_FIND_ERROR
       OUTPUT_STRIP_TRAILING_WHITESPACE
       RESULT_VARIABLE _TORCH_FIND_RESULT
     )
     if(_TORCH_FIND_RESULT EQUAL 0 AND EXISTS "${_TORCH_CMAKE_DIR}")
       set(Torch_DIR "${_TORCH_CMAKE_DIR}")
       message(STATUS "Auto-detected Torch_DIR: ${Torch_DIR}")
+    else()
+      message(FATAL_ERROR
+        "Torch was not found using ${Python3_EXECUTABLE}.\n"
+        "Create and activate a virtual environment, then install CPU PyTorch:\n"
+        "  python3 -m venv .venv\n"
+        "  source .venv/bin/activate\n"
+        "  python -m pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
+        "Reconfigure with -DPython3_EXECUTABLE=/absolute/path/to/.venv/bin/python\n"
+        "or supply -DTorch_DIR=/path/to/torch/share/cmake/Torch.\n"
+        "Python diagnostic: ${_TORCH_FIND_ERROR}")
     endif()
   endif()
 endif()
