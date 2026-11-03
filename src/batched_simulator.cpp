@@ -123,6 +123,8 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
     double previous_time = 0.0;
     double previous_energy = 0.0;
     double interval_service_cost = 0.0;
+    double interval_quality_sum = 0.0;
+    size_t interval_quality_count = 0;
 
     auto fleet_energy = [&]() { return active_energy + idle_energy + sleep_energy + wake_energy; };
     auto emit_transition = [&](const std::shared_ptr<DecisionSnapshot>& successor, bool terminal) {
@@ -130,10 +132,15 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
         double energy = fleet_energy() - previous_energy;
         double reward = -(cfg.reward_weights.energy * energy + interval_service_cost);
         arrival_transitions.push_back({energy, interval_service_cost, reward, t - previous_time, terminal});
-        if (online_update && allocator.is_learner())
+        if (online_update && allocator.is_learner()) {
             allocator.observe_arrival_transition(previous_decision, reward, successor, terminal, t - previous_time);
+            allocator.observe_transition_components(previous_decision, energy,
+                                                      interval_quality_sum, interval_quality_count);
+        }
         previous_energy = fleet_energy();
         interval_service_cost = 0.0;
+        interval_quality_sum = 0.0;
+        interval_quality_count = 0;
     };
 
     auto all_empty = [&]() {
@@ -271,6 +278,8 @@ std::vector<JobResult> BatchedSimulator::run(Allocator& allocator,
                 gpu.jobs_completed += 1;
                 JobResult result = make_result(*it, gpu, end_time);
                 results.push_back(result);
+                interval_quality_sum += result.quality;
+                ++interval_quality_count;
                 const auto& weights = cfg.reward_weights;
                 interval_service_cost += weights.latency * result.latency +
                     weights.quality_loss * result.quality_loss + weights.min_quality_penalty *

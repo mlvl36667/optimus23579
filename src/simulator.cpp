@@ -13,6 +13,10 @@ RewardWeights RewardWeights::profile(const std::string& name) {
     RewardWeights w;
     if (name == "energy") {
         w.latency = 0.05; w.energy = 1.0; w.quality_loss = 0.3; w.min_quality = 0.6;
+    } else if (name == "energy_q93") {
+        // Evaluation ranks by energy subject to the fleet-average quality
+        // constraint. train_learner supplies an adaptive Lagrange multiplier.
+        w.latency = 0.0; w.energy = 1.0; w.quality_loss = 0.0;
     } else if (name == "balanced") {
         w.latency = 1.0; w.energy = 0.02; w.quality_loss = 10.0;
     } else if (name == "quality") {
@@ -22,7 +26,7 @@ RewardWeights RewardWeights::profile(const std::string& name) {
     } else {
         throw std::invalid_argument(
             "unknown objective '" + name +
-            "'. choices: energy, balanced, quality, latency");
+            "'. choices: energy, energy_q93, balanced, quality, latency");
     }
     return w;
 }

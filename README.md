@@ -328,6 +328,82 @@ difficulty compared with the earlier constant-discount experiments.
 
 ### Q-learning exploration and coverage experiment
 
+The comparison runner's tabular Q-learning uses 5 difficulty, 3 load and 2
+batch-fill bins (30 states total). It selects one of three model sizes; GPU
+placement is handled by the fixed, batch-aware `least_loaded` scheduler. This
+reduces its table from 1,080 to 90 state/action pairs.
+
+For the batched engine, `--q-transition-model PATH` exports an empirical
+transition model from Q-learning's training trajectories. The CSV contains
+all 30 source states, 3 model-size actions, and 31 possible outcomes (the 30
+states plus terminal), including zero-count outcomes. `observations` is the
+sample count for the source state/action and `probability` is the observed
+frequency. A row with zero observations is unknown, not a measured zero
+transition probability. This is an estimate from the chosen training policy;
+increase `--episodes` and exploration to improve coverage.
+
+To solve that empirical model with value iteration and export its estimated
+`Q*`, `V*`, and greedy policy `pi*`, run:
+
+```bash
+python3 tools/value_iteration.py transitions.csv --gamma 0.95 \
+  --output optimal_policy.csv
+```
+
+The output labels these as model estimates. It computes the greedy policy only
+over actions with observed samples; unobserved state/action pairs have blank
+Q-values, and states without observed actions are reported as uncovered. Thus
+`pi*` is optimal for the sampled model and supported actions, not a guarantee
+of the true simulator's global optimum until coverage is adequate.
+
+To evaluate the exported policy in the simulator on the same final prompt
+stream as the trained learners, pass its CSV back to `llm_run` with
+`--q-policy optimal_policy.csv`. It appears in the normal allocator comparison
+as `value_iteration`; unseen states fall back to `SMALL/least_loaded`, and the
+number of such fallbacks is reported. Match engine, objective, fleet, and
+arrival parameters to the ones used to estimate the transition model.
+
+Use `--objective energy_q93` for the constrained objective: minimize energy
+subject to fleet-average quality of at least 0.93. During training, each
+learner uses a projected Lagrange multiplier that rises when an episode misses
+the quality target and falls when the target is exceeded. Evaluation ranks
+feasible policies by system energy and reports quality separately. This
+controls the reported mean-quality constraint rather than requiring every
+individual prompt to meet 0.93.
+
+The transition export also records energy and completed-prompt quality totals,
+so a constrained value-iteration model can be recomputed for a selected
+Lagrange multiplier without mixing the learners' changing training rewards:
+
+```bash
+python3 tools/value_iteration.py build-cpu/transitions_energy_q93.csv \
+  --gamma 0.95 --quality-floor 0.93 --quality-lambda 0 \
+  --output optimal_policy_energy_q93.csv
+```
+
+DQN checkpoints use `--dqn-save model.pt`; this writes the LibTorch weights
+and a matching `model.pt.meta` manifest containing the engine, input-feature
+schema, and ordered action list. `--dqn-load model.pt` checks that manifest
+before loading. `--dqn-trace decisions.csv` writes each final evaluation
+decision with all 18 input features, the chosen model/GPU rule, and all action
+Q-values, so the learned policy can be inspected after the process exits.
+`--epsilon-trace PATH` and `--q-action-trace PATH` provide the corresponding
+decision logs for the bandit and tabular learner. The three logs share prompt
+IDs and include each learner's chosen model; the DQN log additionally includes
+its GPU rule and all 18 Q-values.
+
+The arrival process defaults to an exponential interarrival time with a mean of
+1 second. `--mean-interarrival S` sets this mean for both training and final
+evaluation. Smaller values create denser traffic and make high batch-fill states
+more likely in the batched engine; `--n-prompts` changes episode length, not
+arrival density. For example:
+
+```bash
+./build/llm_run --engine batched --episodes 1000 --objective energy \
+  --mean-interarrival 0.2 --q-epsilon 0.3 --q-epsilon-decay 0.99999 \
+  --q-epsilon-min 0.03 --q-visits experiments/q_visits_dense.csv
+```
+
 `--q-alpha X` sets the tabular learning rate (default 0.1; valid range `(0,1]`).
 `--q-reward-stats PATH` exports reward, target and TD-error statistics grouped by
 state/action, terminal flag and nonoverlapping 5,000-update windows. It includes

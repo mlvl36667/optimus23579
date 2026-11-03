@@ -82,6 +82,8 @@ public:
         const Prompt&, const std::vector<GPU>&, double, const EnvObservation*) { return nullptr; }
     virtual void observe_arrival_transition(const std::shared_ptr<DecisionSnapshot>&,
         double reward, const std::shared_ptr<DecisionSnapshot>&, bool, double) { update(reward); }
+    virtual void observe_transition_components(const std::shared_ptr<DecisionSnapshot>&,
+        double /*energy*/, double /*quality_sum*/, size_t /*quality_count*/) {}
 
     // Correct (s,a,r,s') interface for the batched engine.
     virtual bool supports_observe_transition() const { return false; }

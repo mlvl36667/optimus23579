@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <istream>
 #include <random>
 #include <string>
 #include <tuple>
@@ -51,6 +52,7 @@ struct DecisionSnapshot {
     // Q-learning: discrete state (d_bin, l_bin, b_bin) + action
     std::tuple<int, int, int> q_state{0, 0, 0};
     Action q_action{Size::SMALL, "least_loaded"};
+    int q_transition_next_index = -2;
     // DQN: state vector + action index
     torch::Tensor dqn_state;
     int dqn_action_idx = 0;
@@ -78,6 +80,7 @@ public:
     // test accessors
     size_t q_size() const { return q_.size(); }
     size_t counts_size() const { return counts_.size(); }
+    void set_action_trace(std::ostream* output);
 
 private:
     double epsilon_;
@@ -88,6 +91,8 @@ private:
     std::map<std::pair<int, int>, double> q_;      // (bin, size_value) -> value
     std::map<std::pair<int, int>, int> counts_;
     std::optional<std::pair<int, int>> last_key_;
+    std::ostream* action_trace_ = nullptr;
+    uint64_t action_trace_rows_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -105,7 +110,7 @@ public:
     std::optional<AllocationDecision> allocate(
         const Prompt&, std::vector<GPU>&, const std::vector<LLM>&, double,
         const EnvObservation*) override;
-    std::string name() const override { return "q_learning"; }
+    std::string name() const override { return fixed_policy_mode_ ? "value_iteration" : "q_learning"; }
     bool is_learner() const override { return true; }
     void reset_for_episode() override;
     void update(double reward) override;
@@ -120,15 +125,24 @@ public:
 
     int state_space_size() const { return n_diff_bins_ * n_load_bins_ * n_batch_bins_ * std::max(1, horizon_steps_); }
     void set_finite_horizon(int steps);
+    // Restrict actions to one least-loaded GPU-placement rule per model size.
+    // Configure before the first allocation/training step.
+    void use_model_only_actions();
     std::shared_ptr<DecisionSnapshot> arrival_state(const Prompt&, const std::vector<GPU>&,
         double, const EnvObservation*) override;
     void observe_arrival_transition(const std::shared_ptr<DecisionSnapshot>&, double,
         const std::shared_ptr<DecisionSnapshot>&, bool, double) override;
+    void observe_transition_components(const std::shared_ptr<DecisionSnapshot>&,
+        double energy, double quality_sum, size_t quality_count) override;
     int action_space_size() const { return actions_ ? static_cast<int>(actions_->size()) : 0; }
     size_t q_size() const { return q_.size(); }
     double effective_gamma(std::optional<double> holding_time) const;
     void set_epsilon(double e) { epsilon_ = e; }
     void write_visits(std::ostream& output) const;
+    void write_transition_model(std::ostream& output) const;
+    void load_fixed_policy(std::istream& input);
+    size_t fixed_policy_misses() const { return fixed_policy_misses_; }
+    void set_action_trace(std::ostream* output);
 
     using State = std::tuple<int, int, int>;
     double q_value(const State& state, const Action& action) const;
@@ -146,6 +160,13 @@ private:
     struct RewardStats {
         Moments reward, target, td_error, absolute_td_error;
     };
+    struct TransitionCount {
+        uint64_t count = 0;
+        double reward_sum = 0.0;
+        double energy_sum = 0.0;
+        double quality_sum = 0.0;
+        uint64_t quality_count = 0;
+    };
     std::map<std::tuple<State, Action, bool, uint64_t>, RewardStats> reward_stats_;
     void apply_td(const State&, const Action&, double reward, double bootstrap,
                   double discount, bool terminal);
@@ -159,11 +180,19 @@ private:
     double alpha_, gamma_, beta_d_;
     double epsilon_, initial_epsilon_, epsilon_decay_, epsilon_min_;
     int n_diff_bins_, n_load_bins_, n_batch_bins_;
+    bool model_only_actions_ = false;
+    bool fixed_policy_mode_ = false;
+    size_t fixed_policy_misses_ = 0;
     std::mt19937_64 rng_;
 
     std::map<State, std::map<Action, double>> q_;
     std::map<State, std::map<Action, uint64_t>> visits_;
     std::map<State, std::map<Action, uint64_t>> updates_;
+    std::map<std::tuple<State, Action, int>, TransitionCount> transitions_;
+    std::map<State, Action> fixed_policy_;
+    std::ostream* action_trace_ = nullptr;
+    bool action_trace_header_written_ = false;
+    uint64_t action_trace_rows_ = 0;
     std::optional<State> prev_state_;
     std::optional<Action> prev_action_;
     std::optional<double> prev_reward_;
@@ -212,6 +241,9 @@ public:
         const std::shared_ptr<DecisionSnapshot>&, bool, double) override;
     size_t replay_size() const { return replay_.size(); }
     double effective_gamma(std::optional<double> holding_time) const;
+    void load_model(const std::string& path, const std::string& engine);
+    void save_model(const std::string& path, const std::string& engine) const;
+    void set_action_trace(std::ostream* output, const std::string& engine);
 
     torch::Tensor state_vector(const Prompt& prompt, const std::vector<GPU>& gpus,
                                double current_time, const EnvObservation* env_state) const;
@@ -232,6 +264,8 @@ private:
     void store_transition(torch::Tensor s, int a, double r, torch::Tensor s_next,
                           bool done, double gamma);
     void train_step();
+    std::string model_manifest(const std::string& engine) const;
+    void write_action_trace_header();
 
     double epsilon_, initial_epsilon_, epsilon_decay_, epsilon_min_;
     double gamma_, beta_d_, lr_;
@@ -239,10 +273,17 @@ private:
     std::mt19937_64 rng_;
 
     std::optional<std::vector<Action>> actions_;
+    // [difficulty, input size, fleet load/queue (3), tier load/queue (6),
+    //  fleet power/batch/queue (4), per-tier batch fill (3)]
     int state_dim_ = 18;
     std::vector<ReplayItem> replay_;
     int replay_max_;
     long step_count_ = 0;
+    std::string model_load_path_;
+    std::string model_engine_;
+    std::ostream* action_trace_ = nullptr;
+    bool action_trace_header_written_ = false;
+    uint64_t action_trace_rows_ = 0;
 
     QNetwork q_net_{nullptr};
     QNetwork target_net_{nullptr};
@@ -274,6 +315,7 @@ TrainingCurve train_learner(Allocator& allocator, int n_episodes = 50,
                             int n_large_gpus = 1,
                             const std::string& objective = "energy",
                             bool verbose = true,
-                            const std::string& engine = "static");
+                            const std::string& engine = "static",
+                            double mean_interarrival = 1.0);
 
 }  // namespace llm_alloc
